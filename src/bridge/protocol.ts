@@ -1,0 +1,26 @@
+﻿export type PreviewBridgeError = {
+  message: string;
+  line?: number;
+  column?: number;
+};
+
+export type PreviewBridgeState = {
+  currentNodeRecordId: number | null;
+  currentDialogueIndex: number | null;
+  startNodeNames: string[];
+};
+
+export type ReloadRequest = { id: number; method: "reload" };
+export type SeekRequest = { id: number; method: "seek"; params: { nodeRecordId: number; dialogueIndex: number } };
+export type GetStateRequest = { id: number; method: "get_state" };
+export type BridgeRequest = ReloadRequest | SeekRequest | GetStateRequest;
+
+export type ReloadResponse = { id: number; ok: true };
+export type SeekResponse = { id: number; ok: true };
+export type GetStateResponse = { id: number; ok: true; state: PreviewBridgeState };
+export type BridgeErrorResponse = { id: number; ok: false; error: PreviewBridgeError };
+export type BridgeResponse = ReloadResponse | SeekResponse | GetStateResponse | BridgeErrorResponse;
+
+export type StateChangedEvent = { method: "state_changed"; ok: true; state: PreviewBridgeState };
+
+export type ScenarioFile = { name: string };
