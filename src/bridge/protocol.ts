@@ -1,4 +1,4 @@
-﻿export type PreviewBridgeError = {
+export type PreviewBridgeError = {
   message: string;
   line?: number;
   column?: number;
@@ -24,3 +24,25 @@ export type BridgeResponse = ReloadResponse | SeekResponse | GetStateResponse | 
 export type StateChangedEvent = { method: "state_changed"; ok: true; state: PreviewBridgeState };
 
 export type ScenarioFile = { name: string };
+export type AssetFile = { path: string };
+export type ProjectSession = {
+  hasProject: boolean;
+  projectDir: string;
+};
+export type GenerateResult = {
+  finalScript: string;
+  attempts: number;
+  applied: boolean;
+  lastError?: PreviewBridgeError;
+  summary: string;
+};
+export type VersionInfo = {
+  id: string;
+  timestampMs: number;
+  preview: string;
+  summary: string;
+};
+export type SummaryReadyEvent = {
+  targetFile: string;
+  summary: string;
+};
