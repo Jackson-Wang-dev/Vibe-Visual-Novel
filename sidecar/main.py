@@ -19,7 +19,7 @@ except ImportError:  # pragma: no cover - lets the sidecar report a useful runti
 NEW_CHARS_PREFIX = "#NEWCHARS:"
 DEFAULT_FLASH_MODEL = "deepseek-v4-flash"
 DEFAULT_PRO_MODEL = "deepseek-v4-pro"
-DEFAULT_PLANNING_MODEL = DEFAULT_FLASH_MODEL
+DEFAULT_PLANNING_MODEL = DEFAULT_PRO_MODEL
 
 STAGING_FUNCTIONS = """## Available NovaScript staging functions
 
@@ -38,7 +38,7 @@ Classify the user's request into exactly one kind:
 - staging_effect: the user asks for mood, weather, lighting, pacing, camera, animation, audio, VFX, or other presentation effects. This should modify NovaScript function calls / `<| ... |>` blocks and should not rewrite dialogue text by default.
 - incremental_tweak: a small follow-up adjustment to the current preview position, such as "move it down a little" or "the head is cropped". This route is defined now for the future interactive tweak flow; keep scope narrow.
 
-Use NovaScript boundaries when deciding: wrapped text/dialogue lines are content edits, while `<| ... |>` eager blocks and function calls are staging edits.
+Use NovaScript boundaries when deciding: wrapped text/dialogue lines are content edits, while `<| ... |>` eager blocks and function calls are staging edits. Read the current target file content as the source of truth before routing, and prefer the narrowest edit mode that preserves unrelated existing code and staging.
 Set needs_staging true only when the request benefits from a dedicated staging plan before codegen. Pure dialogue_edit should usually skip staging. staging_effect should usually use staging. incremental_tweak should usually skip staging unless it asks for multi-dimensional mood/effect planning.
 """
 
@@ -162,7 +162,7 @@ def build_staging_prompt(existing_content: str, user_prompt: str, intent: Intent
         intent_hint = f"\nIntent kind: {intent.kind}\nTarget scope: {intent.target_scope}\n"
     return f"""You are the staging director for a Nova2 visual novel scene. Analyze the user's request across five dimensions: sound, text presentation, visual color, visual animation, and visual VFX.
 
-Return structured fields only. If a dimension is irrelevant, leave it as an empty string. Do not invent work just to fill fields. Describe intent and likely function calls briefly; do not write full NovaScript here.{intent_hint}
+Return structured fields only. If a dimension is irrelevant, leave it as an empty string. Do not invent work just to fill fields. Base the plan on concrete details already present in the current target file and the NovaScript staging functions below; do not invent assets, shaders, speakers, or timing conventions. Describe intent and likely function calls briefly; do not write full NovaScript here.{intent_hint}
 
 {STAGING_FUNCTIONS}
 
@@ -177,9 +177,9 @@ Return structured fields only. If a dimension is irrelevant, leave it as an empt
 
 def append_intent_to_prompt(prompt: str, intent: Intent) -> str:
     constraints = {
-        "from_scratch": "The target may be new or broad. Follow the existing project references and output a complete valid NovaScript file.",
+        "from_scratch": "The target may be new or broad. Use the injected NovaScript reference, project asset lists, and performance notes as the source of truth, then output a complete valid NovaScript file.",
         "dialogue_edit": "Only edit spoken/narration text lines requested by the user. Do not add staging function changes unless explicitly requested.",
-        "staging_effect": "Implement presentation changes through NovaScript function calls and `<| ... |>` blocks. Do not rewrite dialogue text by default.",
+        "staging_effect": "Implement presentation changes through NovaScript function calls and `<| ... |>` blocks grounded in the existing file and project reference. Do not rewrite dialogue text by default.",
         "incremental_tweak": "Keep the change minimal and local to the requested scope. Do not rewrite unrelated content.",
     }
     return (
@@ -268,7 +268,7 @@ def analyze_intent(state: CodegenState) -> CodegenState:
         intent = Intent(kind="from_scratch", target_scope="target file", needs_staging=False)
         return {**state, "intent": intent.model_dump(), "codegen_prompt": append_intent_to_prompt(state["prompt"], intent)}
     prompt = build_intent_prompt(state.get("existing_content", ""), user_prompt) + "\n\nReturn JSON only with keys: kind, target_scope, needs_staging."
-    intent = Intent.model_validate(invoke_json_model(state.get("model") or DEFAULT_FLASH_MODEL, state.get("api_key", ""), prompt))
+    intent = Intent.model_validate(invoke_json_model(state.get("planning_model") or DEFAULT_PLANNING_MODEL, state.get("api_key", ""), prompt))
     return {**state, "intent": intent.model_dump(), "codegen_prompt": append_intent_to_prompt(state["prompt"], intent)}
 
 

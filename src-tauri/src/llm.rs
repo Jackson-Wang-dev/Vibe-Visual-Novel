@@ -9,6 +9,7 @@ const ZHIPU_CHAT_COMPLETIONS_URL: &str = "https://open.bigmodel.cn/api/paas/v4/c
 const ZHIPU_MODEL: &str = "glm-4.6v-flash";
 const DEEPSEEK_CHAT_COMPLETIONS_URL: &str = "https://api.deepseek.com/chat/completions";
 pub const DEEPSEEK_MODEL_FLASH: &str = "deepseek-v4-flash";
+pub const DEEPSEEK_MODEL_PRO: &str = "deepseek-v4-pro";
 const CAPTION_INSTRUCTION: &str = "Describe this image concisely for an AI scriptwriter who may need to reference it later. Focus on visible subject, pose, clothing, expression, framing, and notable visual details. Return plain text only.";
 
 #[derive(Debug, Deserialize)]

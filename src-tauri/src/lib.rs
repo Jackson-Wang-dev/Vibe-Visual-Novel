@@ -874,7 +874,7 @@ impl AppRuntime {
                     &prompt,
                     &config.deepseek_api_key,
                     llm::DEEPSEEK_MODEL_FLASH,
-                    llm::DEEPSEEK_MODEL_FLASH,
+                    llm::DEEPSEEK_MODEL_PRO,
                     &request.user_prompt,
                     &existing_content,
                     intent_hint,

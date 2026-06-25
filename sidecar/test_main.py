@@ -1,4 +1,14 @@
-from sidecar.main import Intent, append_intent_to_prompt, extract_json_object, parse_generated_output, route_after_analyze
+from sidecar.main import (
+    DEFAULT_PLANNING_MODEL,
+    DEFAULT_PRO_MODEL,
+    Intent,
+    append_intent_to_prompt,
+    build_intent_prompt,
+    build_staging_prompt,
+    extract_json_object,
+    parse_generated_output,
+    route_after_analyze,
+)
 
 
 def test_parse_generated_output_with_newchars():
@@ -26,3 +36,13 @@ def test_intent_prompt_constraints_cover_four_kinds():
 
 def test_extract_json_object_accepts_fenced_json():
     assert extract_json_object('```json\n{"kind":"incremental_tweak","needs_staging":false}\n```')["kind"] == "incremental_tweak"
+
+def test_planning_agents_default_to_pro():
+    assert DEFAULT_PLANNING_MODEL == DEFAULT_PRO_MODEL
+
+
+def test_router_and_director_prompts_require_grounding():
+    intent_prompt = build_intent_prompt('show("bg", "backgrounds/corridor")', '加雨天演出')
+    staging_prompt = build_staging_prompt('show("bg", "backgrounds/corridor")', '加雨天演出')
+    assert "current target file content as the source of truth" in intent_prompt
+    assert "concrete details already present in the current target file" in staging_prompt
