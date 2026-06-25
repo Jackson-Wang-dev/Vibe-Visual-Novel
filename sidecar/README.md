@@ -1,6 +1,6 @@
 # VVN Agents Sidecar
 
-Prompt 6 moves the codegen step into this Python sidecar. VVN still owns the outer retry loop, deterministic validators, character registration, draft writes, reload/seek, version history, and summaries. For each generation attempt VVN sends the already-built prompt plus the DeepSeek API key to `POST /generate`; the sidecar runs a tiny LangGraph graph (`codegen -> parse`) and returns structured `{ new_chars, script }`.
+Prompt 7 moves the staging and codegen steps into this Python sidecar. VVN still owns the outer retry loop, deterministic validators, character registration, draft writes, reload/seek, version history, and summaries. For each generation attempt VVN sends the already-built prompt plus the DeepSeek API key to `POST /generate`; the sidecar runs a LangGraph graph (`staging -> codegen -> parse`): `staging` uses `deepseek-v4-pro` with structured `Plan` output, `codegen` uses `deepseek-v4-flash`, and `parse` returns structured `{ new_chars, script }`.
 
 At startup the sidecar binds `127.0.0.1:0`, prints the selected port as the first stdout line, and serves FastAPI on that local port. API keys are not stored in environment variables or bundled into the executable; VVN passes the key per request.
 

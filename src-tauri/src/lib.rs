@@ -4,12 +4,12 @@ mod llm;
 mod version_history;
 
 use generation::{
-    build_atmosphere_plan_prompt, build_atmosphere_plan_retry_prompt, build_generation_prompt, build_retry_prompt,
+    build_generation_prompt, build_retry_prompt,
     build_summary_prompt, find_unknown_asset_paths, find_unknown_audio_tracks, find_unknown_shaders,
     find_unknown_sound_tracks, format_asset_path_issues, format_audio_track_issues, format_shader_issues,
     format_sound_track_issues, generate_with_prompt, list_known_asset_script_paths, list_known_audio_layout,
-    list_known_character_bind_names, list_known_shader_names, parse_atmosphere_plan,
-    register_new_characters, AtmospherePlan, NewCharacterSpec,
+    list_known_character_bind_names, list_known_shader_names,
+    register_new_characters, NewCharacterSpec,
 };
 use version_history::VersionInfo;
 use parking_lot::Mutex;
@@ -252,6 +252,9 @@ struct SidecarGenerateRequest<'a> {
     prompt: &'a str,
     api_key: &'a str,
     model: &'a str,
+    planning_model: &'a str,
+    user_prompt: &'a str,
+    existing_content: &'a str,
 }
 
 #[derive(Debug, Deserialize)]
@@ -732,6 +735,9 @@ impl AppRuntime {
         prompt: &str,
         api_key: &str,
         model: &str,
+        planning_model: &str,
+        user_prompt: &str,
+        existing_content: &str,
     ) -> Result<(Vec<NewCharacterSpec>, String), BackendError> {
         self.ensure_sidecar_started();
         let port = self.inner.lock().sidecar_port;
@@ -742,7 +748,14 @@ impl AppRuntime {
         let client = reqwest::Client::new();
         let response = client
             .post(format!("http://127.0.0.1:{port}/generate"))
-            .json(&SidecarGenerateRequest { prompt, api_key, model })
+            .json(&SidecarGenerateRequest {
+                prompt,
+                api_key,
+                model,
+                planning_model,
+                user_prompt,
+                existing_content,
+            })
             .send()
             .await
             .map_err(|error| BackendError::message(format!("VVN agents sidecar /generate failed: {error}")))?;
@@ -761,45 +774,19 @@ impl AppRuntime {
         }
         Ok((payload.new_chars, payload.script.trim().to_string()))
     }
-    /// Stage 1 of the pipeline: ask the model to decompose the requested mood/effect across
-    /// sound/text/visual axes before any NovaScript gets written, so stage 2 (the actual script
-    /// edit) has an explicit multi-dimensional checklist instead of defaulting to a single
-    /// `tint()` call. One retry on a JSON parse failure; if that retry also fails to parse, falls
-    /// back to `None` (no plan) rather than blocking the whole generation request on a planning
-    /// hiccup - the main generation prompt works fine without a plan, just less guided.
-    async fn build_atmosphere_plan(&self, existing_content: &str, user_prompt: &str, api_key: &str) -> Option<AtmospherePlan> {
-        // Stays on the pro model deliberately - composing an atmosphere across sound/text/visual
-        // is a creative-judgment call, unlike the more mechanical script-writing/summary stages.
-        let base_prompt = build_atmosphere_plan_prompt(existing_content, user_prompt);
-        let first_output = generate_with_prompt(&base_prompt, api_key, llm::DEEPSEEK_MODEL_PRO).await.ok()?;
-        let parse_error = match parse_atmosphere_plan(&first_output) {
-            Ok(plan) => return Some(plan),
-            Err(error) => error,
-        };
-
-        let retry_prompt = build_atmosphere_plan_retry_prompt(&base_prompt, &first_output, &parse_error);
-        let retry_output = generate_with_prompt(&retry_prompt, api_key, llm::DEEPSEEK_MODEL_PRO).await.ok()?;
-        parse_atmosphere_plan(&retry_output).ok()
-    }
-
     async fn generate_script_with_retry_inner(&self, request: GenerateRequest) -> Result<GenerateResult, BackendError> {
         let config = self.get_config();
         let nova2_project_dir = Path::new(&config.nova2_project_dir);
         // Empty string (rather than failing) when target_file doesn't exist yet - that's the
         // legitimate "generate a brand new file from scratch" case build_generation_prompt handles.
         let existing_content = self.read_scenario_file(&request.target_file).unwrap_or_default();
-
-        let atmosphere_plan = self
-            .build_atmosphere_plan(&existing_content, &request.user_prompt, &config.deepseek_api_key)
-            .await;
-
         let base_prompt = build_generation_prompt(
             nova2_project_dir,
             &config.vfx_notes_path,
             &request.target_file,
             &existing_content,
             &request.user_prompt,
-            atmosphere_plan.as_ref(),
+            None,
         )?;
 
         let known_asset_paths = list_known_asset_script_paths(nova2_project_dir);
@@ -815,7 +802,14 @@ impl AppRuntime {
         while attempts < 3 {
             attempts += 1;
             let (new_chars, script) = self
-                .generate_with_sidecar(&prompt, &config.deepseek_api_key, llm::DEEPSEEK_MODEL_FLASH)
+                .generate_with_sidecar(
+                    &prompt,
+                    &config.deepseek_api_key,
+                    llm::DEEPSEEK_MODEL_FLASH,
+                    llm::DEEPSEEK_MODEL_PRO,
+                    &request.user_prompt,
+                    &existing_content,
+                )
                 .await?;
             register_new_characters(nova2_project_dir, &new_chars)?;
             self.write_scenario_file_draft(&request.target_file, &script)?;

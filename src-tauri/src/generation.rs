@@ -571,46 +571,6 @@ pub fn format_shader_issues(issues: &[AssetPathIssue]) -> String {
     format!("脚本里 vfx() 引用了不存在的 shader：{}", details.join("；"))
 }
 
-const ATMOSPHERE_PLAN_SECTIONS: &str = "## 可用的演出函数（节选自 NovaScript 参考文档）\n\n\
-- 声音：`play(channel, track_name, vol, duration)`（`channel` 常见 `\"bgm\"`/`\"bgs\"`）、`sound(track_name, vol)`\n\
-- 文本表现：`set_box(pos_name, style_name)`、`set_text_appear(mode, char_speed, fade_duration)`、`text_delay(time)`、`box_hide_show(duration, pos_name, style_name)`\n\
-- 画面色彩：`tint(obj, color, duration, entry)`、`env_tint(obj, color, duration, entry)`\n\
-- 画面动画：`move(obj, coord, scale, angle, duration, entry)`、`wait(duration, entry)`、`anim_hold_begin()`/`anim_hold_end()`、`cam_punch(entry)`\n\
-- 画面 VFX：`vfx(obj, shader_layer, t, duration, properties, entry)`";
-
-/// First stage of the two-stage generation pipeline: before writing any NovaScript, ask the model
-/// to decompose the requested mood/atmosphere across sound / text-presentation / visual-color /
-/// visual-animation / visual-vfx, so the later script-writing stage has an explicit checklist to
-/// implement instead of defaulting to a single `tint()` call. Grounded in the real function names
-/// from novascript-reference.md so the plan doesn't invent functions that don't exist.
-pub fn build_atmosphere_plan_prompt(existing_content: &str, user_prompt: &str) -> String {
-    let existing_content = existing_content.trim();
-    format!(
-        "你是 Nova2 视觉小说的演出策划。针对下面的“用户需求”，从声音、文本表现、画面色彩、画面动画、画面 VFX 五个维度分别思考是否需要用上，以及大致怎么做（用一句中文描述思路和大致会调用的函数，不需要写出完整代码）。哪个维度跟这次需求无关就给空字符串，不要为了凑数硬加。\n\n\
-        只输出一个 JSON 对象，字段固定为 sound/text_presentation/visual_color/visual_animation/visual_vfx，值都是字符串，不要输出任何其它文字、解释或 Markdown 代码块围栏。\n\n\
-        {ATMOSPHERE_PLAN_SECTIONS}\n\n\
-        ## 目标文件当前内容（供你判断场景上下文，不要在这一步直接改它）\n\n{}\n\n\
-        ## 用户需求\n\n{user_prompt}",
-        if existing_content.is_empty() { "(空)" } else { existing_content }
-    )
-}
-
-pub fn parse_atmosphere_plan(output: &str) -> Result<AtmospherePlan, BackendError> {
-    let trimmed = output.trim();
-    let json_text = trimmed
-        .strip_prefix("```json")
-        .or_else(|| trimmed.strip_prefix("```"))
-        .map(|rest| rest.trim_end_matches("```").trim())
-        .unwrap_or(trimmed);
-    serde_json::from_str(json_text).map_err(|error| BackendError::message(format!("解析演出策划 JSON 失败: {error}")))
-}
-
-pub fn build_atmosphere_plan_retry_prompt(base_prompt: &str, raw_output: &str, error: &BackendError) -> String {
-    format!(
-        "{base_prompt}\n\n你上一次的输出如下:\n{raw_output}\n解析失败: {error}。请只输出一个合法的 JSON 对象，不要输出任何额外文字或 Markdown 代码块围栏。"
-    )
-}
-
 /// After a generation attempt is successfully applied, asks the model for a short plain-language
 /// changelog entry (not NovaScript) describing what concretely changed, so it can be stored
 /// alongside the version-history snapshot and shown to the user without them having to diff raw
@@ -968,27 +928,6 @@ mod tests {
         let known = vec!["mono".to_string()];
         let issues = find_unknown_shaders("vfx(\"cam\", null)", &known);
         assert!(issues.is_empty());
-    }
-
-    #[test]
-    fn parses_atmosphere_plan_json() {
-        let output = r#"{"sound":"渐入雨声","text_presentation":"","visual_color":"调暗色调","visual_animation":"","visual_vfx":""}"#;
-        let plan = parse_atmosphere_plan(output).unwrap();
-        assert_eq!(plan.sound, "渐入雨声");
-        assert_eq!(plan.visual_color, "调暗色调");
-        assert_eq!(plan.text_presentation, "");
-    }
-
-    #[test]
-    fn parses_atmosphere_plan_json_wrapped_in_markdown_fence() {
-        let output = "```json\n{\"sound\":\"渐入雨声\",\"text_presentation\":\"\",\"visual_color\":\"\",\"visual_animation\":\"\",\"visual_vfx\":\"\"}\n```";
-        let plan = parse_atmosphere_plan(output).unwrap();
-        assert_eq!(plan.sound, "渐入雨声");
-    }
-
-    #[test]
-    fn rejects_malformed_atmosphere_plan_json() {
-        assert!(parse_atmosphere_plan("not json").is_err());
     }
 
     #[test]
