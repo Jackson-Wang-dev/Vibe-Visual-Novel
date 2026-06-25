@@ -1,8 +1,8 @@
 # VVN Agents Sidecar
 
-Prompt 5 introduces a minimal Python sidecar process for the future multi-agent pipeline. The current service intentionally behaves as an echo bridge: VVN calls `POST /generate`, ignores the echo response, and then continues through the existing Rust DeepSeek generation path so user-visible behavior stays unchanged.
+Prompt 6 moves the codegen step into this Python sidecar. VVN still owns the outer retry loop, deterministic validators, character registration, draft writes, reload/seek, version history, and summaries. For each generation attempt VVN sends the already-built prompt plus the DeepSeek API key to `POST /generate`; the sidecar runs a tiny LangGraph graph (`codegen -> parse`) and returns structured `{ new_chars, script }`.
 
-At startup the sidecar binds `127.0.0.1:0`, prints the selected port as the first stdout line, and serves FastAPI on that local port.
+At startup the sidecar binds `127.0.0.1:0`, prints the selected port as the first stdout line, and serves FastAPI on that local port. API keys are not stored in environment variables or bundled into the executable; VVN passes the key per request.
 
 ## Development
 

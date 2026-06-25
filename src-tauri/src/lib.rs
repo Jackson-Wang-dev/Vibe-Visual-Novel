@@ -8,8 +8,8 @@ use generation::{
     build_summary_prompt, find_unknown_asset_paths, find_unknown_audio_tracks, find_unknown_shaders,
     find_unknown_sound_tracks, format_asset_path_issues, format_audio_track_issues, format_shader_issues,
     format_sound_track_issues, generate_with_prompt, list_known_asset_script_paths, list_known_audio_layout,
-    list_known_character_bind_names, list_known_shader_names, parse_atmosphere_plan, parse_generated_output,
-    register_new_characters, AtmospherePlan,
+    list_known_character_bind_names, list_known_shader_names, parse_atmosphere_plan,
+    register_new_characters, AtmospherePlan, NewCharacterSpec,
 };
 use version_history::VersionInfo;
 use parking_lot::Mutex;
@@ -244,6 +244,21 @@ struct RuntimeSnapshot {
     latest_state: Option<PreviewBridgeState>,
     is_connected: bool,
     is_godot_running: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SidecarGenerateRequest<'a> {
+    prompt: &'a str,
+    api_key: &'a str,
+    model: &'a str,
+}
+
+#[derive(Debug, Deserialize)]
+struct SidecarGenerateResponse {
+    #[serde(default)]
+    new_chars: Vec<NewCharacterSpec>,
+    script: String,
 }
 
 #[derive(Debug)]
@@ -712,21 +727,39 @@ impl AppRuntime {
         inner.sidecar_port = Some(port);
     }
 
-    async fn generate_with_sidecar_echo(&self, prompt: &str) {
+    async fn generate_with_sidecar(
+        &self,
+        prompt: &str,
+        api_key: &str,
+        model: &str,
+    ) -> Result<(Vec<NewCharacterSpec>, String), BackendError> {
         self.ensure_sidecar_started();
         let port = self.inner.lock().sidecar_port;
         let Some(port) = port else {
-            return;
+            return Err(BackendError::message("VVN agents sidecar is not available"));
         };
+
         let client = reqwest::Client::new();
-        if let Err(error) = client
+        let response = client
             .post(format!("http://127.0.0.1:{port}/generate"))
-            .json(&serde_json::json!({ "prompt": prompt }))
+            .json(&SidecarGenerateRequest { prompt, api_key, model })
             .send()
             .await
-        {
-            eprintln!("vvn: agents sidecar /generate echo failed, keeping direct DeepSeek path: {error}");
+            .map_err(|error| BackendError::message(format!("VVN agents sidecar /generate failed: {error}")))?;
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .map_err(|error| BackendError::message(format!("Failed to read VVN agents sidecar response: {error}")))?;
+        if !status.is_success() {
+            return Err(BackendError::message(format!("VVN agents sidecar /generate returned {status}: {body}")));
         }
+        let payload: SidecarGenerateResponse = serde_json::from_str(&body)
+            .map_err(|error| BackendError::message(format!("Failed to parse VVN agents sidecar response: {error}; body={body}")))?;
+        if payload.script.trim().is_empty() {
+            return Err(BackendError::message("VVN agents sidecar returned an empty script"));
+        }
+        Ok((payload.new_chars, payload.script.trim().to_string()))
     }
     /// Stage 1 of the pipeline: ask the model to decompose the requested mood/effect across
     /// sound/text/visual axes before any NovaScript gets written, so stage 2 (the actual script
@@ -781,9 +814,9 @@ impl AppRuntime {
 
         while attempts < 3 {
             attempts += 1;
-            self.generate_with_sidecar_echo(&prompt).await;
-            let model_output = generate_with_prompt(&prompt, &config.deepseek_api_key, llm::DEEPSEEK_MODEL_FLASH).await?;
-            let (new_chars, script) = parse_generated_output(&model_output)?;
+            let (new_chars, script) = self
+                .generate_with_sidecar(&prompt, &config.deepseek_api_key, llm::DEEPSEEK_MODEL_FLASH)
+                .await?;
             register_new_characters(nova2_project_dir, &new_chars)?;
             self.write_scenario_file_draft(&request.target_file, &script)?;
             final_script = script.clone();

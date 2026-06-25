@@ -2,6 +2,7 @@ use crate::{character_template, llm, BackendError, PreviewBridgeError};
 use serde::Deserialize;
 use std::{fs, path::Path};
 
+#[cfg(test)]
 const NEW_CHARS_PREFIX: &str = "#NEWCHARS:";
 const ASSET_ROOTS: [&str; 2] = ["standings", "backgrounds"];
 const PATH_ARG_CALLS: [&str; 6] = ["show", "trans_fade", "trans_left", "trans_right", "trans_up", "trans_down"];
@@ -480,6 +481,7 @@ pub fn build_generation_prompt(
     Ok(sections.join("\n\n"))
 }
 
+#[cfg(test)]
 pub fn parse_generated_output(output: &str) -> Result<(Vec<NewCharacterSpec>, String), BackendError> {
     let trimmed = output.trim();
     if trimmed.is_empty() {

@@ -159,7 +159,7 @@ cd src-tauri && cargo test   # 4 个 PreviewBridge 协议反序列化单测
 4. **API Key 留空**：设置依然能正常保存，但点「开始生成」/「生成描述」会报错——这两个是可选功能，核心的"手改剧本 + 热重载 + Seek 预览"流程完全不需要任何 API Key。
 ## Agents sidecar
 
-VVN includes a Prompt 5 Python sidecar scaffold in `sidecar/`. On Tauri startup the Rust runtime launches `binaries/vvn-agents`, reads the first stdout line as the local FastAPI port, and keeps the child process alive until project close. The `/generate` endpoint is currently an echo bridge only; VVN still performs generation through the existing Rust DeepSeek path after the sidecar call, so behavior remains equivalent while the future multi-agent pipeline gets a stable process boundary.
+VVN includes a Python agents sidecar in `sidecar/`. On Tauri startup the Rust runtime launches `binaries/vvn-agents`, reads the first stdout line as the local FastAPI port, and keeps the child process alive until project close. As of Prompt 6, `/generate` owns the codegen node: VVN sends the already-built prompt and DeepSeek API key per request, the sidecar runs a small LangGraph `codegen -> parse` graph, and returns structured `{ new_chars, script }`. VVN still owns retries, deterministic validators, writes, reload/seek, snapshots, and summaries.
 
 The Windows sidecar artifact is bundled at `src-tauri/binaries/vvn-agents-x86_64-pc-windows-msvc.exe`. Rebuild it with:
 

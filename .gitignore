@@ -26,3 +26,6 @@ dist-ssr
 # Python sidecar build artifacts
 sidecar/build/
 sidecar/*.spec
+__pycache__/
+sidecar/__pycache__/
+*.pyc
