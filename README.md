@@ -157,3 +157,15 @@ cd src-tauri && cargo test   # 4 个 PreviewBridge 协议反序列化单测
 2. **第一次「进入项目」前先确认 NovaRR 能独立跑起来**。VVN 只是无脑拉起一个进程，C# 编译错误它看不出来，只会表现成"等了 20 秒连不上 PreviewBridge"这种含糊的超时提示。
 3. **端口冲突**：如果同时手动开着一个 Godot 编辑器会话在跑 NovaRR，又用 VVN 再拉起一份，两边会抢同一个 `9999` 端口——PreviewBridge 抢不到端口只会打日志、自己保持禁用状态（不会让 Godot 整个崩掉），但 VVN 那边会一直连不上、反复重试到超时。把其中一个关掉，或者在设置里改端口。
 4. **API Key 留空**：设置依然能正常保存，但点「开始生成」/「生成描述」会报错——这两个是可选功能，核心的"手改剧本 + 热重载 + Seek 预览"流程完全不需要任何 API Key。
+## Agents sidecar
+
+VVN includes a Prompt 5 Python sidecar scaffold in `sidecar/`. On Tauri startup the Rust runtime launches `binaries/vvn-agents`, reads the first stdout line as the local FastAPI port, and keeps the child process alive until project close. The `/generate` endpoint is currently an echo bridge only; VVN still performs generation through the existing Rust DeepSeek path after the sidecar call, so behavior remains equivalent while the future multi-agent pipeline gets a stable process boundary.
+
+The Windows sidecar artifact is bundled at `src-tauri/binaries/vvn-agents-x86_64-pc-windows-msvc.exe`. Rebuild it with:
+
+```powershell
+python -m PyInstaller --onefile --name vvn-agents sidecar\main.py --distpath src-tauri\binaries --workpath sidecar\build --specpath sidecar
+Copy-Item -LiteralPath src-tauri\binaries\vvn-agents.exe -Destination src-tauri\binaries\vvn-agents-x86_64-pc-windows-msvc.exe -Force
+```
+
+`sidecar/build/` and `sidecar/*.spec` are local PyInstaller intermediates and are ignored by Git.

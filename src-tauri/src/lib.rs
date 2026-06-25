@@ -15,6 +15,10 @@ use version_history::VersionInfo;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tauri_plugin_shell::{
+    process::{CommandChild, CommandEvent},
+    ShellExt,
+};
 use std::{
     fs,
     io::{BufRead, BufReader, Write},
@@ -247,6 +251,8 @@ struct RuntimeInner {
     config: AppConfig,
     latest_state: Option<PreviewBridgeState>,
     godot_child: Option<Child>,
+    sidecar_child: Option<CommandChild>,
+    sidecar_port: Option<u16>,
     command_counter: u64,
     state_listener_started: bool,
 }
@@ -257,6 +263,8 @@ impl Default for RuntimeInner {
             config: AppConfig::default(),
             latest_state: None,
             godot_child: None,
+            sidecar_child: None,
+            sidecar_port: None,
             command_counter: 0,
             state_listener_started: false,
         }
@@ -307,6 +315,7 @@ impl AppRuntime {
         if let Ok(config) = load_config_from_disk(&self.app) {
             self.inner.lock().config = config;
         }
+        self.ensure_sidecar_started();
     }
 
     fn config_path(&self) -> Result<PathBuf, BackendError> {
@@ -349,7 +358,11 @@ impl AppRuntime {
             let _ = child.kill();
             let _ = child.wait();
         }
+        if let Some(child) = inner.sidecar_child.take() {
+            let _ = child.kill();
+        }
         inner.godot_child = None;
+        inner.sidecar_port = None;
         Ok(ProjectSession {
             has_project: false,
             project_dir: String::new(),
@@ -629,6 +642,92 @@ impl AppRuntime {
         Ok(content)
     }
 
+
+    fn ensure_sidecar_started(&self) {
+        if self.inner.lock().sidecar_port.is_some() {
+            return;
+        }
+
+        let command = match self.app.shell().sidecar("binaries/vvn-agents") {
+            Ok(command) => command,
+            Err(error) => {
+                eprintln!("vvn: agents sidecar unavailable, falling back to direct DeepSeek path: {error}");
+                return;
+            }
+        };
+        let (mut rx, child) = match command.spawn() {
+            Ok(pair) => pair,
+            Err(error) => {
+                eprintln!("vvn: failed to spawn agents sidecar, falling back to direct DeepSeek path: {error}");
+                return;
+            }
+        };
+
+        let mut port = None;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            match rx.blocking_recv() {
+                Some(CommandEvent::Stdout(line)) => {
+                    let text = String::from_utf8_lossy(&line).trim().to_string();
+                    if let Ok(value) = text.parse::<u16>() {
+                        port = Some(value);
+                        break;
+                    }
+                }
+                Some(CommandEvent::Stderr(line)) => {
+                    eprintln!("vvn agents: {}", String::from_utf8_lossy(&line).trim());
+                }
+                Some(CommandEvent::Terminated(payload)) => {
+                    eprintln!("vvn: agents sidecar exited before handshake: {:?}", payload.code);
+                    break;
+                }
+                Some(CommandEvent::Error(error)) => {
+                    eprintln!("vvn: agents sidecar error before handshake: {error}");
+                    break;
+                }
+                Some(_) => {}
+                None => break,
+            }
+        }
+
+        let Some(port) = port else {
+            let _ = child.kill();
+            return;
+        };
+
+        thread::spawn(move || {
+            while let Some(event) = rx.blocking_recv() {
+                match event {
+                    CommandEvent::Stderr(line) => eprintln!("vvn agents: {}", String::from_utf8_lossy(&line).trim()),
+                    CommandEvent::Error(error) => eprintln!("vvn agents: {error}"),
+                    CommandEvent::Terminated(_) => break,
+                    CommandEvent::Stdout(_) => {}
+                    _ => {}
+                }
+            }
+        });
+
+        let mut inner = self.inner.lock();
+        inner.sidecar_child = Some(child);
+        inner.sidecar_port = Some(port);
+    }
+
+    async fn generate_with_sidecar_echo(&self, prompt: &str) {
+        self.ensure_sidecar_started();
+        let port = self.inner.lock().sidecar_port;
+        let Some(port) = port else {
+            return;
+        };
+        let client = reqwest::Client::new();
+        if let Err(error) = client
+            .post(format!("http://127.0.0.1:{port}/generate"))
+            .json(&serde_json::json!({ "prompt": prompt }))
+            .send()
+            .await
+        {
+            eprintln!("vvn: agents sidecar /generate echo failed, keeping direct DeepSeek path: {error}");
+        }
+    }
     /// Stage 1 of the pipeline: ask the model to decompose the requested mood/effect across
     /// sound/text/visual axes before any NovaScript gets written, so stage 2 (the actual script
     /// edit) has an explicit multi-dimensional checklist instead of defaulting to a single
@@ -682,6 +781,7 @@ impl AppRuntime {
 
         while attempts < 3 {
             attempts += 1;
+            self.generate_with_sidecar_echo(&prompt).await;
             let model_output = generate_with_prompt(&prompt, &config.deepseek_api_key, llm::DEEPSEEK_MODEL_FLASH).await?;
             let (new_chars, script) = parse_generated_output(&model_output)?;
             register_new_characters(nova2_project_dir, &new_chars)?;
@@ -1108,6 +1208,7 @@ async fn generate_script_with_retry(
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_shell::init())
         .setup(|app| {
             let runtime = AppRuntime::new(app.handle().clone());
             runtime.initialize();
