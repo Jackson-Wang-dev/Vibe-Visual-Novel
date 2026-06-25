@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import socket
-from typing import Any, TypedDict
+from typing import Any, Literal, TypedDict
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
@@ -29,6 +29,18 @@ STAGING_FUNCTIONS = """## Available NovaScript staging functions
 - Visual VFX: `vfx(obj, shader_layer, t, duration, properties, entry)`
 """
 
+ANALYZE_PROMPT = """You are the semantic router for a Nova2 visual novel script editor.
+Classify the user's request into exactly one kind:
+
+- from_scratch: create a new scene or substantial new content from an empty/missing target file.
+- dialogue_edit: the user explicitly asks to rewrite spoken/narration text. This should only touch dialogue/narrative text lines unless the request also explicitly asks for staging.
+- staging_effect: the user asks for mood, weather, lighting, pacing, camera, animation, audio, VFX, or other presentation effects. This should modify NovaScript function calls / `<| ... |>` blocks and should not rewrite dialogue text by default.
+- incremental_tweak: a small follow-up adjustment to the current preview position, such as "move it down a little" or "the head is cropped". This route is defined now for the future interactive tweak flow; keep scope narrow.
+
+Use NovaScript boundaries when deciding: wrapped text/dialogue lines are content edits, while `<| ... |>` eager blocks and function calls are staging edits.
+Set needs_staging true only when the request benefits from a dedicated staging plan before codegen. Pure dialogue_edit should usually skip staging. staging_effect should usually use staging. incremental_tweak should usually skip staging unless it asks for multi-dimensional mood/effect planning.
+"""
+
 
 class NewCharacterSpec(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
@@ -36,6 +48,14 @@ class NewCharacterSpec(BaseModel):
     node: str
     bind: str
     folder: str
+
+
+class Intent(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    kind: Literal["from_scratch", "dialogue_edit", "staging_effect", "incremental_tweak"]
+    target_scope: str = ""
+    needs_staging: bool = False
 
 
 class Plan(BaseModel):
@@ -91,6 +111,7 @@ class CodegenState(TypedDict, total=False):
     user_prompt: str
     existing_content: str
     raw_output: str
+    intent: dict[str, Any]
     plan: dict[str, str]
     new_chars: list[dict[str, str]]
     script: str
@@ -118,11 +139,27 @@ def parse_generated_output(output: str) -> GenerateResponse:
     return GenerateResponse(script=trimmed)
 
 
-def build_staging_prompt(existing_content: str, user_prompt: str) -> str:
+def build_intent_prompt(existing_content: str, user_prompt: str) -> str:
     existing = existing_content.strip() or "(empty - this is a new file)"
+    return f"""{ANALYZE_PROMPT}
+
+## Current target file content
+
+{existing}
+
+## User request
+
+{user_prompt}"""
+
+
+def build_staging_prompt(existing_content: str, user_prompt: str, intent: Intent | None = None) -> str:
+    existing = existing_content.strip() or "(empty - this is a new file)"
+    intent_hint = ""
+    if intent is not None:
+        intent_hint = f"\nIntent kind: {intent.kind}\nTarget scope: {intent.target_scope}\n"
     return f"""You are the staging director for a Nova2 visual novel scene. Analyze the user's request across five dimensions: sound, text presentation, visual color, visual animation, and visual VFX.
 
-Return structured fields only. If a dimension is irrelevant, leave it as an empty string. Do not invent work just to fill fields. Describe intent and likely function calls briefly; do not write full NovaScript here.
+Return structured fields only. If a dimension is irrelevant, leave it as an empty string. Do not invent work just to fill fields. Describe intent and likely function calls briefly; do not write full NovaScript here.{intent_hint}
 
 {STAGING_FUNCTIONS}
 
@@ -133,6 +170,22 @@ Return structured fields only. If a dimension is irrelevant, leave it as an empt
 ## User request
 
 {user_prompt}"""
+
+
+def append_intent_to_prompt(prompt: str, intent: Intent) -> str:
+    constraints = {
+        "from_scratch": "The target may be new or broad. Follow the existing project references and output a complete valid NovaScript file.",
+        "dialogue_edit": "Only edit spoken/narration text lines requested by the user. Do not add staging function changes unless explicitly requested.",
+        "staging_effect": "Implement presentation changes through NovaScript function calls and `<| ... |>` blocks. Do not rewrite dialogue text by default.",
+        "incremental_tweak": "Keep the change minimal and local to the requested scope. Do not rewrite unrelated content.",
+    }
+    return (
+        f"{prompt}\n\n"
+        "## Semantic analysis for this request\n\n"
+        f"- Kind: {intent.kind}\n"
+        f"- Target scope: {intent.target_scope or '(unspecified)'}\n"
+        f"- Constraint: {constraints[intent.kind]}"
+    )
 
 
 def append_plan_to_prompt(prompt: str, plan: Plan) -> str:
@@ -167,19 +220,38 @@ def make_deepseek(model: str, api_key: str):
     return ChatDeepSeek(model=model, api_key=api_key)
 
 
+def analyze_intent(state: CodegenState) -> CodegenState:
+    user_prompt = state.get("user_prompt", "").strip()
+    if not user_prompt:
+        intent = Intent(kind="from_scratch", target_scope="target file", needs_staging=False)
+        return {**state, "intent": intent.model_dump(), "codegen_prompt": append_intent_to_prompt(state["prompt"], intent)}
+    llm = make_deepseek(state.get("model") or DEFAULT_FLASH_MODEL, state.get("api_key", ""))
+    structured_llm = llm.with_structured_output(Intent)
+    intent = structured_llm.invoke(build_intent_prompt(state.get("existing_content", ""), user_prompt))
+    if not isinstance(intent, Intent):
+        intent = Intent.model_validate(intent)
+    return {**state, "intent": intent.model_dump(), "codegen_prompt": append_intent_to_prompt(state["prompt"], intent)}
+
+
+def route_after_analyze(state: CodegenState) -> str:
+    intent = Intent.model_validate(state.get("intent") or {"kind": "from_scratch", "target_scope": "", "needs_staging": False})
+    return "staging" if intent.needs_staging else "codegen"
+
+
 def stage_plan(state: CodegenState) -> CodegenState:
     user_prompt = state.get("user_prompt", "").strip()
     if not user_prompt:
-        return {**state, "codegen_prompt": state["prompt"], "plan": {}}
+        return {**state, "plan": {}}
+    intent = Intent.model_validate(state.get("intent") or {"kind": "from_scratch", "target_scope": "", "needs_staging": True})
     llm = make_deepseek(state.get("planning_model") or DEFAULT_PRO_MODEL, state.get("api_key", ""))
     structured_llm = llm.with_structured_output(Plan)
-    plan = structured_llm.invoke(build_staging_prompt(state.get("existing_content", ""), user_prompt))
+    plan = structured_llm.invoke(build_staging_prompt(state.get("existing_content", ""), user_prompt, intent))
     if not isinstance(plan, Plan):
         plan = Plan.model_validate(plan)
     return {
         **state,
         "plan": plan.model_dump(),
-        "codegen_prompt": append_plan_to_prompt(state["prompt"], plan),
+        "codegen_prompt": append_plan_to_prompt(state.get("codegen_prompt") or state["prompt"], plan),
     }
 
 
@@ -208,10 +280,12 @@ def run_codegen_graph(request: GenerateRequest) -> GenerateResponse:
     if not prompt.strip():
         raise RuntimeError("prompt is empty")
     graph = StateGraph(CodegenState)
+    graph.add_node("analyze", analyze_intent)
     graph.add_node("staging", stage_plan)
     graph.add_node("codegen", call_deepseek)
     graph.add_node("parse", parse_codegen)
-    graph.set_entry_point("staging")
+    graph.set_entry_point("analyze")
+    graph.add_conditional_edges("analyze", route_after_analyze, {"staging": "staging", "codegen": "codegen"})
     graph.add_edge("staging", "codegen")
     graph.add_edge("codegen", "parse")
     graph.add_edge("parse", END)
