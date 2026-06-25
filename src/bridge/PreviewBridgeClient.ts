@@ -113,6 +113,12 @@ export class PreviewBridgeClient {
     });
   }
 
+  async incrementalTweak(userPrompt: string, targetFile: string): Promise<GenerateResult> {
+    return invoke<GenerateResult>("incremental_tweak", {
+      request: { userPrompt, targetFile },
+    });
+  }
+
   async listScriptVersions(name: string): Promise<VersionInfo[]> {
     return invoke<VersionInfo[]>("list_script_versions", { name });
   }

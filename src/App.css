@@ -343,6 +343,16 @@ label {
   align-items: end;
 }
 
+.ai-action-stack {
+  display: grid;
+  gap: 8px;
+  min-width: 150px;
+}
+
+.ai-action-stack button {
+  width: 100%;
+}
+
 .hero-prompt {
   min-height: 240px;
 }

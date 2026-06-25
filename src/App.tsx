@@ -530,6 +530,43 @@ function App() {
     }
   };
 
+  const handleIncrementalTweak = async () => {
+    if (!generatePanel.targetFile.trim()) {
+      applyError({ message: "请先选择 target_file" }, "AI 微调失败");
+      return;
+    }
+    if (bridgeState.currentNodeRecordId === null || bridgeState.currentDialogueIndex === null) {
+      applyError({ message: "请先让预览窗口同步到一个当前节点和对话行" }, "AI 微调失败");
+      return;
+    }
+    setIsGeneratingScript(true);
+    setGeneratePanel((current) => ({ ...current, result: null }));
+    setStatusTone("busy");
+    setStatusTitle("正在微调当前预览");
+    setStatusMessage(`会围绕 node ${bridgeState.currentNodeRecordId} / line ${bridgeState.currentDialogueIndex} 对 ${generatePanel.targetFile} 做局部修改，并复用校验、reload 和自动定位流程。`);
+    setLastError(null);
+    try {
+      const result = await previewBridgeClient.incrementalTweak(generatePanel.userPrompt, generatePanel.targetFile);
+      setGeneratePanel((current) => ({ ...current, result }));
+      if (result.applied) {
+        await loadScriptContent(generatePanel.targetFile);
+        await refreshRuntimeStatus();
+        setStatusTone("success");
+        setStatusTitle("AI 微调完成并已应用");
+        setStatusMessage(`已在第 ${result.attempts} 次尝试后成功 reload。预览会尽量回到本次局部修改附近。`);
+      } else {
+        setStatusTone("error");
+        setStatusTitle("AI 微调未通过引擎校验");
+        setStatusMessage(`已尝试 ${result.attempts} 次，但最终 reload 仍失败。脚本草稿保留在结果面板中供检查。`);
+        setLastError(result.lastError ?? null);
+      }
+    } catch (error) {
+      applyUnknownError(error, "AI 微调失败");
+    } finally {
+      setIsGeneratingScript(false);
+    }
+  };
+
   return (
     <main className={`app-shell ${hasProject ? "app-shell-project" : "app-shell-empty"}`}>
       <button
@@ -729,9 +766,26 @@ function App() {
                       ))}
                     </select>
                   </label>
-                  <button type="button" onClick={handleGenerateScript} disabled={isGeneratingScript || isLoadingProject || isHydrating || !generatePanel.userPrompt.trim()}>
-                    {isGeneratingScript ? "生成中..." : "开始生成"}
-                  </button>
+                  <div className="ai-action-stack">
+                    <button type="button" onClick={handleGenerateScript} disabled={isGeneratingScript || isLoadingProject || isHydrating || !generatePanel.userPrompt.trim()}>
+                      {isGeneratingScript ? "生成中..." : "开始生成"}
+                    </button>
+                    <button
+                      type="button"
+                      className="secondary-button"
+                      onClick={handleIncrementalTweak}
+                      disabled={
+                        isGeneratingScript ||
+                        isLoadingProject ||
+                        isHydrating ||
+                        !generatePanel.userPrompt.trim() ||
+                        bridgeState.currentNodeRecordId === null ||
+                        bridgeState.currentDialogueIndex === null
+                      }
+                    >
+                      微调当前预览
+                    </button>
+                  </div>
                 </div>
               </div>
               {generatePanel.result ? (

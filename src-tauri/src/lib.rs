@@ -209,6 +209,14 @@ struct GenerateRequest {
     target_file: String,
 }
 
+#[derive(Debug, Clone)]
+enum GenerationMode {
+    Standard,
+    IncrementalTweak {
+        preview_state: Option<PreviewBridgeState>,
+    },
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct GenerateResult {
@@ -775,12 +783,30 @@ impl AppRuntime {
         Ok((payload.new_chars, payload.script.trim().to_string()))
     }
     async fn generate_script_with_retry_inner(&self, request: GenerateRequest) -> Result<GenerateResult, BackendError> {
+        self.generate_script_with_mode(request, GenerationMode::Standard).await
+    }
+
+    async fn incremental_tweak_inner(&self, request: GenerateRequest) -> Result<GenerateResult, BackendError> {
+        let preview_state = self.ensure_bridge_ready().ok();
+        self.generate_script_with_mode(request, GenerationMode::IncrementalTweak { preview_state }).await
+    }
+
+    async fn generate_script_with_mode(&self, request: GenerateRequest, mode: GenerationMode) -> Result<GenerateResult, BackendError> {
         let config = self.get_config();
         let nova2_project_dir = Path::new(&config.nova2_project_dir);
         // Empty string (rather than failing) when target_file doesn't exist yet - that's the
         // legitimate "generate a brand new file from scratch" case build_generation_prompt handles.
         let existing_content = self.read_scenario_file(&request.target_file).unwrap_or_default();
-        let base_prompt = build_generation_prompt(
+        let mode_context = match &mode {
+            GenerationMode::Standard => None,
+            GenerationMode::IncrementalTweak { preview_state } => Some(build_incremental_tweak_context(
+                &request.target_file,
+                &request.user_prompt,
+                &existing_content,
+                preview_state.as_ref(),
+            )),
+        };
+        let mut base_prompt = build_generation_prompt(
             nova2_project_dir,
             &config.vfx_notes_path,
             &request.target_file,
@@ -788,6 +814,10 @@ impl AppRuntime {
             &request.user_prompt,
             None,
         )?;
+        if let Some(context) = mode_context {
+            base_prompt.push_str("\n\n");
+            base_prompt.push_str(&context);
+        }
 
         let known_asset_paths = list_known_asset_script_paths(nova2_project_dir);
         let known_characters = list_known_character_bind_names(nova2_project_dir);
@@ -1230,6 +1260,42 @@ async fn generate_script_with_retry(
         .await
         .map_err(|error| error.to_bridge_error())
 }
+#[tauri::command]
+async fn incremental_tweak(runtime: State<'_, AppRuntime>, request: GenerateRequest) -> Result<GenerateResult, PreviewBridgeError> {
+    runtime
+        .incremental_tweak_inner(request)
+        .await
+        .map_err(|error| error.to_bridge_error())
+}
+
+fn build_incremental_tweak_context(
+    target_file: &str,
+    user_prompt: &str,
+    existing_content: &str,
+    preview_state: Option<&PreviewBridgeState>,
+) -> String {
+    let node = preview_state
+        .and_then(|state| state.current_node_record_id)
+        .map_or_else(|| "unknown".to_string(), |value| value.to_string());
+    let dialogue = preview_state
+        .and_then(|state| state.current_dialogue_index)
+        .map_or_else(|| "unknown".to_string(), |value| value.to_string());
+    format!(
+        "## Incremental tweak mode\n\n\
+Intent hint: classify this request as incremental_tweak unless the user explicitly asks for broad new content.\n\
+Target file: {target_file}\n\
+Current preview nodeRecordId: {node}\n\
+Current preview dialogueIndex: {dialogue}\n\
+User tweak: {user_prompt}\n\n\
+Rules:\n\
+- Keep the edit minimal and local to the current preview position.\n\
+- Use the current target file content below as the source of truth.\n\
+- Preserve unrelated dialogue, staging, node order, comments, and whitespace as much as possible.\n\
+- Output a complete valid NovaScript file, not a patch.\n\n\
+## Current target_file content snapshot\n\n\
+{existing_content}"
+    )
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -1248,6 +1314,7 @@ pub fn run() {
             caption_asset_cmd,
             generate_script_cmd,
             generate_script_with_retry,
+            incremental_tweak,
             get_project_session,
             leave_project,
             get_runtime_status,
@@ -1331,6 +1398,20 @@ mod bridge_response_tests {
             }
             CommandResult::Success(_) => panic!("expected an error CommandResult"),
         }
+    }
+    #[test]
+    fn incremental_tweak_context_includes_preview_anchor_and_scope_rules() {
+        let state = PreviewBridgeState {
+            current_node_record_id: Some(42),
+            current_dialogue_index: Some(7),
+            start_node_names: vec!["start".to_string()],
+        };
+        let context = build_incremental_tweak_context("chapter1.txt", "move it down a little", "line one", Some(&state));
+        assert!(context.contains("incremental_tweak"));
+        assert!(context.contains("nodeRecordId: 42"));
+        assert!(context.contains("dialogueIndex: 7"));
+        assert!(context.contains("minimal and local"));
+        assert!(context.contains("line one"));
     }
     #[test]
     fn first_changed_line_returns_none_for_new_file_or_no_change() {
