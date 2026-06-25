@@ -46,3 +46,11 @@ export type SummaryReadyEvent = {
   targetFile: string;
   summary: string;
 };
+
+export type GenerationStatusEvent = {
+  phase: string;
+  label: string;
+  detail: string;
+  targetFile: string;
+  attempt?: number;
+};

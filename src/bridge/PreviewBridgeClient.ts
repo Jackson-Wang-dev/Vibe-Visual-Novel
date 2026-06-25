@@ -3,6 +3,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   AssetFile,
   GenerateResult,
+  GenerationStatusEvent,
   PreviewBridgeError,
   PreviewBridgeState,
   ProjectSession,
@@ -14,11 +15,13 @@ import type {
 
 type Listener = (event: StateChangedEvent) => void;
 type SummaryListener = (event: SummaryReadyEvent) => void;
+type GenerationStatusListener = (event: GenerationStatusEvent) => void;
 type BridgeResult = { ok: true; state?: PreviewBridgeState } | { ok: false; error: PreviewBridgeError };
 type LoadProjectResult = { ok: true; state: PreviewBridgeState };
 
 const STATE_CHANGED_EVENT = "preview_bridge://state_changed";
 const SUMMARY_READY_EVENT = "preview_bridge://generation_summary_ready";
+const GENERATION_STATUS_EVENT = "preview_bridge://generation_status";
 
 export type AppConfig = {
   nova2ProjectDir: string;
@@ -41,6 +44,8 @@ export class PreviewBridgeClient {
   private unlistenPromise: Promise<UnlistenFn | null> | null = null;
   private summaryListeners = new Set<SummaryListener>();
   private summaryUnlistenPromise: Promise<UnlistenFn | null> | null = null;
+  private generationStatusListeners = new Set<GenerationStatusListener>();
+  private generationStatusUnlistenPromise: Promise<UnlistenFn | null> | null = null;
 
   async getAppConfig(): Promise<AppConfig> {
     return invoke<AppConfig>("get_app_config");
@@ -147,6 +152,14 @@ export class PreviewBridgeClient {
     };
   }
 
+  onGenerationStatus(listener: GenerationStatusListener) {
+    this.generationStatusListeners.add(listener);
+    void this.ensureGenerationStatusEventBridge();
+    return () => {
+      this.generationStatusListeners.delete(listener);
+    };
+  }
+
   private emitStateChanged(event: StateChangedEvent) {
     this.listeners.forEach((listener) => listener(event));
   }
@@ -173,6 +186,18 @@ export class PreviewBridgeClient {
       }).then((unlisten) => unlisten);
     }
     await this.summaryUnlistenPromise;
+  }
+
+  private async ensureGenerationStatusEventBridge() {
+    if (!this.isTauriRuntime()) {
+      return;
+    }
+    if (!this.generationStatusUnlistenPromise) {
+      this.generationStatusUnlistenPromise = listen<GenerationStatusEvent>(GENERATION_STATUS_EVENT, (event) => {
+        this.generationStatusListeners.forEach((listener) => listener(event.payload));
+      }).then((unlisten) => unlisten);
+    }
+    await this.generationStatusUnlistenPromise;
   }
 
   private isTauriRuntime() {

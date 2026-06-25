@@ -21,6 +21,24 @@ type SeekDraft = {
 type ScriptDraftMap = Record<string, string>;
 type CaptionDraftMap = Record<string, string>;
 
+
+type AgentStep = {
+  id: string;
+  label: string;
+  detail: string;
+};
+
+const agentSteps: AgentStep[] = [
+  { id: "context", label: "Context", detail: "Reading target file, preview anchor, and project indexes" },
+  { id: "route", label: "Routing", detail: "Choosing codegen, staging, dialogue edit, or local tweak" },
+  { id: "codegen", label: "Codegen", detail: "Sidecar agents are producing NovaScript" },
+  { id: "validate", label: "Validate", detail: "Checking assets, audio tracks, shaders, and new characters" },
+  { id: "reload", label: "Reload", detail: "Writing the draft and asking Godot to reload" },
+  { id: "locate", label: "Locate", detail: "Seeking back near the changed line; summary runs in background" },
+];
+
+const agentStepIndexById = new Map(agentSteps.map((step, index) => [step.id, index]));
+
 type GeneratePanelState = {
   userPrompt: string;
   targetFile: string;
@@ -89,6 +107,7 @@ function App() {
   const [isSeeking, setIsSeeking] = useState(false);
   const [isCaptioningAsset, setIsCaptioningAsset] = useState<string | null>(null);
   const [isGeneratingScript, setIsGeneratingScript] = useState(false);
+  const [agentStepIndex, setAgentStepIndex] = useState(0);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [isDeveloperOpen, setIsDeveloperOpen] = useState(false);
   const [isVersionPanelOpen, setIsVersionPanelOpen] = useState(false);
@@ -173,6 +192,17 @@ function App() {
     });
   }, [config]);
 
+  useEffect(() => {
+    return previewBridgeClient.onGenerationStatus((event) => {
+      const nextIndex = agentStepIndexById.get(event.phase);
+      if (nextIndex !== undefined) {
+        setAgentStepIndex(nextIndex);
+      }
+      setStatusTone("busy");
+      setStatusTitle(event.label);
+      setStatusMessage(event.attempt ? `${event.detail} (attempt ${event.attempt})` : event.detail);
+    });
+  }, []);
   useEffect(() => {
     return previewBridgeClient.onSummaryReady((event) => {
       setGeneratePanel((current) =>
@@ -503,6 +533,7 @@ function App() {
       return;
     }
     setIsGeneratingScript(true);
+    setAgentStepIndex(0);
     setGeneratePanel((current) => ({ ...current, result: null }));
     setStatusTone("busy");
     setStatusTitle("正在调用 AI 生成剧本");
@@ -540,6 +571,7 @@ function App() {
       return;
     }
     setIsGeneratingScript(true);
+    setAgentStepIndex(0);
     setGeneratePanel((current) => ({ ...current, result: null }));
     setStatusTone("busy");
     setStatusTitle("正在微调当前预览");
@@ -788,6 +820,28 @@ function App() {
                   </div>
                 </div>
               </div>
+              {isGeneratingScript ? (
+                <div className="agent-activity-panel" aria-live="polite">
+                  <div className="agent-orbit" aria-hidden="true">
+                    <span />
+                    <span />
+                    <span />
+                  </div>
+                  <div className="agent-activity-copy">
+                    <strong>{agentSteps[agentStepIndex]?.label}</strong>
+                    <span>{agentSteps[agentStepIndex]?.detail}</span>
+                  </div>
+                  <div className="agent-step-track">
+                    {agentSteps.map((step, index) => (
+                      <span
+                        key={step.id}
+                        className={index < agentStepIndex ? "done" : index === agentStepIndex ? "active" : ""}
+                        title={`${step.label}: ${step.detail}`}
+                      />
+                    ))}
+                  </div>
+                </div>
+              ) : null}
               {generatePanel.result ? (
                 <div className={`ai-result ${generatePanel.result.applied ? "success" : "error"}`}>
                   {generatePanel.result.summary ? (

@@ -34,11 +34,13 @@ use thiserror::Error;
 
 const STATE_CHANGED_EVENT: &str = "preview_bridge://state_changed";
 const SUMMARY_READY_EVENT: &str = "preview_bridge://generation_summary_ready";
+const GENERATION_STATUS_EVENT: &str = "preview_bridge://generation_status";
 const DEFAULT_PORT: u16 = 9999;
 const CONNECT_TIMEOUT_MS: u64 = 250;
 const SPAWN_SETTLE_MS: u64 = 450;
 const POLL_RETRY_MS: u64 = 350;
 const POLL_TIMEOUT_SECS: u64 = 20;
+const SIDECAR_HANDSHAKE_TIMEOUT_SECS: u64 = 30;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -95,6 +97,17 @@ struct StateChangedEvent {
 struct SummaryReadyEvent {
     target_file: String,
     summary: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GenerationStatusEvent {
+    phase: String,
+    label: String,
+    detail: String,
+    target_file: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    attempt: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -263,6 +276,8 @@ struct SidecarGenerateRequest<'a> {
     planning_model: &'a str,
     user_prompt: &'a str,
     existing_content: &'a str,
+    intent_hint: Option<&'a str>,
+    needs_staging_hint: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -341,7 +356,6 @@ impl AppRuntime {
         if let Ok(config) = load_config_from_disk(&self.app) {
             self.inner.lock().config = config;
         }
-        self.ensure_sidecar_started();
     }
 
     fn config_path(&self) -> Result<PathBuf, BackendError> {
@@ -669,60 +683,59 @@ impl AppRuntime {
     }
 
 
-    fn ensure_sidecar_started(&self) {
-        if self.inner.lock().sidecar_port.is_some() {
-            return;
+    async fn ensure_sidecar_started(&self) -> Result<u16, BackendError> {
+        if let Some(port) = self.inner.lock().sidecar_port {
+            return Ok(port);
         }
 
-        let command = match self.app.shell().sidecar("binaries/vvn-agents") {
-            Ok(command) => command,
-            Err(error) => {
-                eprintln!("vvn: agents sidecar unavailable, falling back to direct DeepSeek path: {error}");
-                return;
-            }
-        };
-        let (mut rx, child) = match command.spawn() {
-            Ok(pair) => pair,
-            Err(error) => {
-                eprintln!("vvn: failed to spawn agents sidecar, falling back to direct DeepSeek path: {error}");
-                return;
-            }
-        };
+        let command = self
+            .app
+            .shell()
+            .sidecar("vvn-agents")
+            .map_err(|error| BackendError::message(format!("VVN agents sidecar command is unavailable: {error}")))?;
+        let (mut rx, child) = command
+            .spawn()
+            .map_err(|error| BackendError::message(format!("Failed to spawn VVN agents sidecar: {error}")))?;
 
-        let mut port = None;
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline {
-            match rx.blocking_recv() {
-                Some(CommandEvent::Stdout(line)) => {
-                    let text = String::from_utf8_lossy(&line).trim().to_string();
-                    if let Ok(value) = text.parse::<u16>() {
-                        port = Some(value);
-                        break;
+        let handshake = async {
+            while let Some(event) = rx.recv().await {
+                match event {
+                    CommandEvent::Stdout(line) => {
+                        let text = String::from_utf8_lossy(&line).trim().to_string();
+                        if let Ok(value) = text.parse::<u16>() {
+                            return Ok(value);
+                        }
                     }
+                    CommandEvent::Stderr(line) => {
+                        eprintln!("vvn agents: {}", String::from_utf8_lossy(&line).trim());
+                    }
+                    CommandEvent::Terminated(payload) => {
+                        return Err(BackendError::message(format!(
+                            "VVN agents sidecar exited before handshake: {:?}",
+                            payload.code
+                        )));
+                    }
+                    CommandEvent::Error(error) => {
+                        return Err(BackendError::message(format!("VVN agents sidecar error before handshake: {error}")));
+                    }
+                    _ => {}
                 }
-                Some(CommandEvent::Stderr(line)) => {
-                    eprintln!("vvn agents: {}", String::from_utf8_lossy(&line).trim());
-                }
-                Some(CommandEvent::Terminated(payload)) => {
-                    eprintln!("vvn: agents sidecar exited before handshake: {:?}", payload.code);
-                    break;
-                }
-                Some(CommandEvent::Error(error)) => {
-                    eprintln!("vvn: agents sidecar error before handshake: {error}");
-                    break;
-                }
-                Some(_) => {}
-                None => break,
             }
-        }
-
-        let Some(port) = port else {
-            let _ = child.kill();
-            return;
+            Err(BackendError::message("VVN agents sidecar closed stdout before reporting a port"))
         };
 
-        thread::spawn(move || {
-            while let Some(event) = rx.blocking_recv() {
+        let port = match tokio::time::timeout(Duration::from_secs(SIDECAR_HANDSHAKE_TIMEOUT_SECS), handshake).await {
+            Ok(result) => result?,
+            Err(_) => {
+                let _ = child.kill();
+                return Err(BackendError::message(format!(
+                    "VVN agents sidecar did not report a port within {SIDECAR_HANDSHAKE_TIMEOUT_SECS}s"
+                )));
+            }
+        };
+
+        tokio::spawn(async move {
+            while let Some(event) = rx.recv().await {
                 match event {
                     CommandEvent::Stderr(line) => eprintln!("vvn agents: {}", String::from_utf8_lossy(&line).trim()),
                     CommandEvent::Error(error) => eprintln!("vvn agents: {error}"),
@@ -736,8 +749,8 @@ impl AppRuntime {
         let mut inner = self.inner.lock();
         inner.sidecar_child = Some(child);
         inner.sidecar_port = Some(port);
+        Ok(port)
     }
-
     async fn generate_with_sidecar(
         &self,
         prompt: &str,
@@ -746,12 +759,10 @@ impl AppRuntime {
         planning_model: &str,
         user_prompt: &str,
         existing_content: &str,
+        intent_hint: Option<&str>,
+        needs_staging_hint: Option<bool>,
     ) -> Result<(Vec<NewCharacterSpec>, String), BackendError> {
-        self.ensure_sidecar_started();
-        let port = self.inner.lock().sidecar_port;
-        let Some(port) = port else {
-            return Err(BackendError::message("VVN agents sidecar is not available"));
-        };
+        let port = self.ensure_sidecar_started().await?;
 
         let client = reqwest::Client::new();
         let response = client
@@ -763,6 +774,8 @@ impl AppRuntime {
                 planning_model,
                 user_prompt,
                 existing_content,
+                intent_hint,
+                needs_staging_hint,
             })
             .send()
             .await
@@ -792,6 +805,13 @@ impl AppRuntime {
     }
 
     async fn generate_script_with_mode(&self, request: GenerateRequest, mode: GenerationMode) -> Result<GenerateResult, BackendError> {
+        self.publish_generation_status(
+            &request.target_file,
+            "context",
+            "Context",
+            "Reading target file, preview anchor, and project indexes",
+            None,
+        );
         let config = self.get_config();
         let nova2_project_dir = Path::new(&config.nova2_project_dir);
         // Empty string (rather than failing) when target_file doesn't exist yet - that's the
@@ -823,6 +843,17 @@ impl AppRuntime {
         let known_characters = list_known_character_bind_names(nova2_project_dir);
         let known_audio_layout = list_known_audio_layout(nova2_project_dir);
         let known_shaders = list_known_shader_names(nova2_project_dir);
+        let (intent_hint, needs_staging_hint) = match &mode {
+            GenerationMode::Standard => (None, None),
+            GenerationMode::IncrementalTweak { .. } => (Some("incremental_tweak"), Some(false)),
+        };
+        self.publish_generation_status(
+            &request.target_file,
+            "route",
+            "Routing",
+            "Choosing generation route from prompt, preview anchor, and edit mode",
+            None,
+        );
 
         let mut prompt = base_prompt.clone();
         let mut attempts = 0;
@@ -831,19 +862,35 @@ impl AppRuntime {
 
         while attempts < 3 {
             attempts += 1;
+            self.publish_generation_status(
+                &request.target_file,
+                "codegen",
+                "Codegen",
+                "Sidecar agents are producing NovaScript",
+                Some(attempts),
+            );
             let (new_chars, script) = self
                 .generate_with_sidecar(
                     &prompt,
                     &config.deepseek_api_key,
                     llm::DEEPSEEK_MODEL_FLASH,
-                    llm::DEEPSEEK_MODEL_PRO,
+                    llm::DEEPSEEK_MODEL_FLASH,
                     &request.user_prompt,
                     &existing_content,
+                    intent_hint,
+                    needs_staging_hint,
                 )
                 .await?;
             register_new_characters(nova2_project_dir, &new_chars)?;
             self.write_scenario_file_draft(&request.target_file, &script)?;
             final_script = script.clone();
+            self.publish_generation_status(
+                &request.target_file,
+                "validate",
+                "Validate",
+                "Checking assets, audio tracks, shaders, and new characters",
+                Some(attempts),
+            );
 
             // Static checks first: Godot's load() on a missing texture/shader/track path silently
             // returns null instead of throwing, so any of these hallucinations would otherwise
@@ -879,9 +926,23 @@ impl AppRuntime {
             }
 
             let changed_line = first_changed_line(&existing_content, &script);
+            self.publish_generation_status(
+                &request.target_file,
+                "reload",
+                "Reload",
+                "Writing the draft and asking Godot to reload",
+                Some(attempts),
+            );
             match self.send_reload()? {
                 CommandResult::Success(_) => {
                     if let Some(line) = changed_line {
+                        self.publish_generation_status(
+                            &request.target_file,
+                            "locate",
+                            "Locate",
+                            "Seeking back near the changed line; summary runs in background",
+                            Some(attempts),
+                        );
                         self.seek_to_changed_line_best_effort(&request.target_file, line);
                     }
 
@@ -915,6 +976,13 @@ impl AppRuntime {
                     });
                 }
                 CommandResult::Error(error) => {
+                    self.publish_generation_status(
+                        &request.target_file,
+                        "codegen",
+                        "Retry",
+                        "Godot reload rejected the draft; asking the model for a corrected version",
+                        Some(attempts),
+                    );
                     prompt = build_retry_prompt(&base_prompt, &script, &error.error);
                     last_error = Some(error.error);
                 }
@@ -1081,6 +1149,20 @@ impl AppRuntime {
             SummaryReadyEvent {
                 target_file: target_file.to_string(),
                 summary: summary.to_string(),
+            },
+        );
+    }
+
+
+    fn publish_generation_status(&self, target_file: &str, phase: &str, label: &str, detail: &str, attempt: Option<u32>) {
+        let _ = self.app.emit(
+            GENERATION_STATUS_EVENT,
+            GenerationStatusEvent {
+                phase: phase.to_string(),
+                label: label.to_string(),
+                detail: detail.to_string(),
+                target_file: target_file.to_string(),
+                attempt,
             },
         );
     }

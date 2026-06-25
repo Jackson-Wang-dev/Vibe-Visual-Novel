@@ -8,12 +8,6 @@ use std::{fs, path::Path};
 const ZHIPU_CHAT_COMPLETIONS_URL: &str = "https://open.bigmodel.cn/api/paas/v4/chat/completions";
 const ZHIPU_MODEL: &str = "glm-4.6v-flash";
 const DEEPSEEK_CHAT_COMPLETIONS_URL: &str = "https://api.deepseek.com/chat/completions";
-// Atmosphere planning (deciding *how* to compose an effect across sound/text/visual) stays on the
-// stronger/slower model - it's the one stage that's pure creative judgment with no syntax to get
-// right. Script generation and the changelog summary both move to the faster model: writing
-// NovaScript once a plan already exists, and writing a plain-language summary, are both more
-// mechanical than the planning step and don't need the heavier model's latency cost.
-pub const DEEPSEEK_MODEL_PRO: &str = "deepseek-v4-pro";
 pub const DEEPSEEK_MODEL_FLASH: &str = "deepseek-v4-flash";
 const CAPTION_INSTRUCTION: &str = "Describe this image concisely for an AI scriptwriter who may need to reference it later. Focus on visible subject, pose, clothing, expression, framing, and notable visual details. Return plain text only.";
 

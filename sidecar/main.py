@@ -19,6 +19,7 @@ except ImportError:  # pragma: no cover - lets the sidecar report a useful runti
 NEW_CHARS_PREFIX = "#NEWCHARS:"
 DEFAULT_FLASH_MODEL = "deepseek-v4-flash"
 DEFAULT_PRO_MODEL = "deepseek-v4-pro"
+DEFAULT_PLANNING_MODEL = DEFAULT_FLASH_MODEL
 
 STAGING_FUNCTIONS = """## Available NovaScript staging functions
 
@@ -86,13 +87,15 @@ class GenerateRequest(BaseModel):
     prompt: str | None = None
     api_key: str | None = Field(default=None, alias="apiKey")
     model: str = DEFAULT_FLASH_MODEL
-    planning_model: str = Field(default=DEFAULT_PRO_MODEL, alias="planningModel")
+    planning_model: str = Field(default=DEFAULT_PLANNING_MODEL, alias="planningModel")
     user_prompt: str | None = Field(default=None, alias="userPrompt")
     target_file: str | None = Field(default=None, alias="targetFile")
     existing_content: str | None = Field(default=None, alias="existingContent")
     reference_md: str | None = Field(default=None, alias="referenceMd")
     snapshot: dict[str, Any] | None = None
     vfx_notes: str | None = Field(default=None, alias="vfxNotes")
+    intent_hint: Literal["from_scratch", "dialogue_edit", "staging_effect", "incremental_tweak"] | None = Field(default=None, alias="intentHint")
+    needs_staging_hint: bool | None = Field(default=None, alias="needsStagingHint")
 
 
 class GenerateResponse(BaseModel):
@@ -220,16 +223,52 @@ def make_deepseek(model: str, api_key: str):
     return ChatDeepSeek(model=model, api_key=api_key)
 
 
+
+def extract_json_object(text: str) -> dict[str, Any]:
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        lines = stripped.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
+        stripped = "\n".join(lines).strip()
+    try:
+        value = json.loads(stripped)
+    except json.JSONDecodeError:
+        start = stripped.find("{")
+        end = stripped.rfind("}")
+        if start < 0 or end <= start:
+            raise
+        value = json.loads(stripped[start : end + 1])
+    if not isinstance(value, dict):
+        raise ValueError("model JSON response must be an object")
+    return value
+
+
+def invoke_json_model(model: str, api_key: str, prompt: str) -> dict[str, Any]:
+    llm = make_deepseek(model, api_key)
+    response = llm.invoke(prompt)
+    content = getattr(response, "content", response)
+    if isinstance(content, list):
+        content = "\n".join(str(part.get("text", part)) if isinstance(part, dict) else str(part) for part in content)
+    return extract_json_object(str(content))
+
 def analyze_intent(state: CodegenState) -> CodegenState:
     user_prompt = state.get("user_prompt", "").strip()
+    intent_hint = state.get("intent_hint", "").strip()
+    if intent_hint:
+        intent = Intent(
+            kind=state["intent_hint"],
+            target_scope="current preview position" if intent_hint == "incremental_tweak" else "target file",
+            needs_staging=bool(state.get("needs_staging_hint", False)),
+        )
+        return {**state, "intent": intent.model_dump(), "codegen_prompt": append_intent_to_prompt(state["prompt"], intent)}
     if not user_prompt:
         intent = Intent(kind="from_scratch", target_scope="target file", needs_staging=False)
         return {**state, "intent": intent.model_dump(), "codegen_prompt": append_intent_to_prompt(state["prompt"], intent)}
-    llm = make_deepseek(state.get("model") or DEFAULT_FLASH_MODEL, state.get("api_key", ""))
-    structured_llm = llm.with_structured_output(Intent)
-    intent = structured_llm.invoke(build_intent_prompt(state.get("existing_content", ""), user_prompt))
-    if not isinstance(intent, Intent):
-        intent = Intent.model_validate(intent)
+    prompt = build_intent_prompt(state.get("existing_content", ""), user_prompt) + "\n\nReturn JSON only with keys: kind, target_scope, needs_staging."
+    intent = Intent.model_validate(invoke_json_model(state.get("model") or DEFAULT_FLASH_MODEL, state.get("api_key", ""), prompt))
     return {**state, "intent": intent.model_dump(), "codegen_prompt": append_intent_to_prompt(state["prompt"], intent)}
 
 
@@ -243,11 +282,8 @@ def stage_plan(state: CodegenState) -> CodegenState:
     if not user_prompt:
         return {**state, "plan": {}}
     intent = Intent.model_validate(state.get("intent") or {"kind": "from_scratch", "target_scope": "", "needs_staging": True})
-    llm = make_deepseek(state.get("planning_model") or DEFAULT_PRO_MODEL, state.get("api_key", ""))
-    structured_llm = llm.with_structured_output(Plan)
-    plan = structured_llm.invoke(build_staging_prompt(state.get("existing_content", ""), user_prompt, intent))
-    if not isinstance(plan, Plan):
-        plan = Plan.model_validate(plan)
+    prompt = build_staging_prompt(state.get("existing_content", ""), user_prompt, intent) + "\n\nReturn JSON only with keys: sound, text_presentation, visual_color, visual_animation, visual_vfx."
+    plan = Plan.model_validate(invoke_json_model(state.get("planning_model") or DEFAULT_PLANNING_MODEL, state.get("api_key", ""), prompt))
     return {
         **state,
         "plan": plan.model_dump(),
@@ -294,9 +330,11 @@ def run_codegen_graph(request: GenerateRequest) -> GenerateResponse:
             "prompt": prompt,
             "api_key": request.api_key or "",
             "model": request.model or DEFAULT_FLASH_MODEL,
-            "planning_model": request.planning_model or DEFAULT_PRO_MODEL,
+            "planning_model": request.planning_model or DEFAULT_PLANNING_MODEL,
             "user_prompt": request.user_prompt or "",
             "existing_content": request.existing_content or "",
+            "intent_hint": request.intent_hint or "",
+            "needs_staging_hint": bool(request.needs_staging_hint),
         }
     )
     return GenerateResponse(

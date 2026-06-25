@@ -357,6 +357,96 @@ label {
   min-height: 240px;
 }
 
+
+.agent-activity-panel {
+  margin-top: 16px;
+  display: grid;
+  grid-template-columns: 44px minmax(0, 1fr);
+  gap: 12px;
+  align-items: center;
+  padding: 14px;
+  border: 1px solid rgba(125, 211, 252, 0.18);
+  border-radius: 12px;
+  background: rgba(15, 23, 42, 0.42);
+}
+
+.agent-orbit {
+  position: relative;
+  width: 38px;
+  height: 38px;
+  border: 1px solid rgba(148, 163, 184, 0.24);
+  border-radius: 50%;
+  animation: agent-spin 2.4s linear infinite;
+}
+
+.agent-orbit span {
+  position: absolute;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #7dd3fc;
+}
+
+.agent-orbit span:nth-child(1) {
+  top: -3px;
+  left: 15px;
+}
+
+.agent-orbit span:nth-child(2) {
+  right: 1px;
+  bottom: 5px;
+  background: #a7f3d0;
+}
+
+.agent-orbit span:nth-child(3) {
+  left: 1px;
+  bottom: 5px;
+  background: #facc15;
+}
+
+.agent-activity-copy {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.agent-activity-copy strong {
+  color: #f8fbff;
+}
+
+.agent-activity-copy span {
+  color: #aebdd3;
+  font-size: 0.9rem;
+}
+
+.agent-step-track {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.agent-step-track span {
+  height: 4px;
+  border-radius: 999px;
+  background: rgba(148, 163, 184, 0.18);
+}
+
+.agent-step-track span.done {
+  background: rgba(125, 211, 252, 0.72);
+}
+
+.agent-step-track span.active {
+  background: #facc15;
+  box-shadow: 0 0 14px rgba(250, 204, 21, 0.35);
+}
+
+@keyframes agent-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 .ai-result {
   margin-top: 16px;
   padding: 16px;

@@ -1,4 +1,4 @@
-from sidecar.main import Intent, append_intent_to_prompt, parse_generated_output, route_after_analyze
+from sidecar.main import Intent, append_intent_to_prompt, extract_json_object, parse_generated_output, route_after_analyze
 
 
 def test_parse_generated_output_with_newchars():
@@ -23,3 +23,6 @@ def test_intent_prompt_constraints_cover_four_kinds():
         prompt = append_intent_to_prompt("BASE", Intent(kind=kind, target_scope="scope", needs_staging=False))
         assert f"Kind: {kind}" in prompt
         assert expected in prompt
+
+def test_extract_json_object_accepts_fenced_json():
+    assert extract_json_object('```json\n{"kind":"incremental_tweak","needs_staging":false}\n```')["kind"] == "incremental_tweak"
