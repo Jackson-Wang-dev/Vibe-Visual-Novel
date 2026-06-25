@@ -141,6 +141,14 @@ struct BridgeSuccessResponse {
     ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     state: Option<PreviewBridgeState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    node_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dialogue_index: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    node_record_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reached: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -206,6 +214,14 @@ struct GenerateResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     last_error: Option<PreviewBridgeError>,
     summary: String,
+}
+
+#[derive(Debug, Clone)]
+struct LocateResult {
+    node_name: String,
+    dialogue_index: i64,
+    node_record_id: Option<i64>,
+    reached: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -705,8 +721,13 @@ impl AppRuntime {
                 continue;
             }
 
+            let changed_line = first_changed_line(&existing_content, &script);
             match self.send_reload()? {
                 CommandResult::Success(_) => {
+                    if let Some(line) = changed_line {
+                        self.seek_to_changed_line_best_effort(&request.target_file, line);
+                    }
+
                     // The changelog summary is a nice-to-have, not part of what the user is
                     // waiting on to see their change applied - reload already succeeded, so return
                     // immediately and write the summary + version-history snapshot in the
@@ -783,6 +804,48 @@ impl AppRuntime {
             }),
         )?;
         self.map_command_response(response)
+    }
+
+    fn send_locate(&self, file: &str, line: u32) -> Result<LocateResult, BackendError> {
+        self.ensure_bridge_ready()?;
+        let port = self.get_config().preview_bridge_port;
+        let response = self.send_request(
+            port,
+            serde_json::json!({
+                "id": self.next_command_id(),
+                "method": "locate",
+                "params": { "file": file, "line": line }
+            }),
+        )?;
+        match response {
+            BridgeResponse::Success(success) if success.ok => Ok(LocateResult {
+                node_name: success.node_name.ok_or_else(|| BackendError::message("locate 响应缺少 nodeName 字段"))?,
+                dialogue_index: success.dialogue_index.ok_or_else(|| BackendError::message("locate 响应缺少 dialogueIndex 字段"))?,
+                node_record_id: success.node_record_id,
+                reached: success.reached.unwrap_or(false),
+            }),
+            BridgeResponse::Error(error) => Err(BackendError::message(error.error.message)),
+            _ => Err(BackendError::message("收到无法识别的 PreviewBridge locate 响应")),
+        }
+    }
+
+    fn seek_to_changed_line_best_effort(&self, file: &str, line: u32) {
+        let Ok(location) = self.send_locate(file, line) else {
+            return;
+        };
+        let Some(node_record_id) = location.node_record_id else {
+            eprintln!(
+                "vvn: locate found {}:{} at {}#{} but it is not reached yet; preview stays where it is",
+                file, line, location.node_name, location.dialogue_index
+            );
+            return;
+        };
+        if !location.reached {
+            return;
+        }
+        if let Err(error) = self.send_seek(node_record_id, location.dialogue_index) {
+            eprintln!("vvn: seek after locate failed for {file}:{line}: {error}");
+        }
     }
 
     fn send_request(&self, port: u16, payload: Value) -> Result<BridgeResponse, BackendError> {
@@ -863,6 +926,22 @@ impl AppRuntime {
                 summary: summary.to_string(),
             },
         );
+    }
+}
+
+fn first_changed_line(before: &str, after: &str) -> Option<u32> {
+    if before.is_empty() || before == after {
+        return None;
+    }
+    let mut before_lines = before.lines();
+    let mut after_lines = after.lines();
+    let mut line = 1u32;
+    loop {
+        match (before_lines.next(), after_lines.next()) {
+            (Some(left), Some(right)) if left == right => line += 1,
+            (Some(_), Some(_)) | (Some(_), None) | (None, Some(_)) => return Some(line),
+            (None, None) => return None,
+        }
     }
 }
 
@@ -1123,6 +1202,33 @@ mod bridge_response_tests {
                 assert_eq!(failure.error.line, Some(7));
             }
             CommandResult::Success(_) => panic!("expected an error CommandResult"),
+        }
+    }
+    #[test]
+    fn first_changed_line_returns_none_for_new_file_or_no_change() {
+        assert_eq!(first_changed_line("", "a\n"), None);
+        assert_eq!(first_changed_line("a\nb\n", "a\nb\n"), None);
+    }
+
+    #[test]
+    fn first_changed_line_finds_modified_inserted_and_deleted_lines() {
+        assert_eq!(first_changed_line("a\nb\nc\n", "a\nB\nc\n"), Some(2));
+        assert_eq!(first_changed_line("a\nb\n", "a\nx\nb\n"), Some(2));
+        assert_eq!(first_changed_line("a\nb\nc\n", "a\nc\n"), Some(2));
+    }
+
+    #[test]
+    fn locate_payload_deserializes_from_bridge_success() {
+        let json = r#"{"id":3,"ok":true,"nodeName":"ch1","dialogueIndex":4,"nodeRecordId":12,"reached":true}"#;
+        let response: BridgeResponse = serde_json::from_str(json).unwrap();
+        match response {
+            BridgeResponse::Success(success) => {
+                assert_eq!(success.node_name.as_deref(), Some("ch1"));
+                assert_eq!(success.dialogue_index, Some(4));
+                assert_eq!(success.node_record_id, Some(12));
+                assert_eq!(success.reached, Some(true));
+            }
+            other => panic!("expected BridgeResponse::Success, got {other:?}"),
         }
     }
 }
