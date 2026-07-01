@@ -4,7 +4,7 @@ use std::{collections::HashMap, fs, path::Path};
 
 #[cfg(test)]
 const NEW_CHARS_PREFIX: &str = "#NEWCHARS:";
-const ASSET_ROOTS: [&str; 2] = ["standings", "backgrounds"];
+const ASSET_ROOTS: [&str; 1] = ["backgrounds"];
 const PATH_ARG_CALLS: [&str; 6] = ["show", "trans_fade", "trans_left", "trans_right", "trans_up", "trans_down"];
 
 #[derive(Debug, Deserialize)]
@@ -60,13 +60,67 @@ pub(crate) fn list_known_character_bind_names(project_dir: &Path) -> Vec<String>
         .collect()
 }
 
-/// Walks `resources/standings` and `resources/backgrounds` (the same two roots
-/// AppRuntime::list_asset_files indexes) and converts each image file into the path string
-/// NovaScript actually expects in a `show`/`trans*` call - relative to `resources/`, no extension,
-/// forward slashes (eg. `resources/backgrounds/room.png` -> `backgrounds/room`). Used both to
-/// ground the generation prompt with real paths and, after generation, to catch the model
-/// dropping a `backgrounds/`/`standings/` prefix it invented from training data instead of reading
-/// the project's actual layout.
+/// Parses `character.gd`'s static `poses` dictionary to extract valid pose aliases per character.
+/// Returns `(bind_name, [pose_alias, ...])` pairs. Pose aliases are the only valid second argument
+/// to `show(charname, ...)` for composite-sprite character objects — raw part paths like
+/// `"standings/Xiben/body"` are internal engine details, not script-level identifiers.
+pub(crate) fn list_known_character_poses(project_dir: &Path) -> Vec<(String, Vec<String>)> {
+    let gd_path = project_dir
+        .join("nova")
+        .join("sources")
+        .join("gdscript")
+        .join("runtime")
+        .join("character.gd");
+    let Ok(content) = fs::read_to_string(&gd_path) else {
+        return Vec::new();
+    };
+    let Some(dict_start) = content.find("static var poses: Dictionary = {") else {
+        return Vec::new();
+    };
+    let mut result: Vec<(String, Vec<String>)> = Vec::new();
+    let mut current_char: Option<String> = None;
+    let mut current_poses: Vec<String> = Vec::new();
+    let mut in_outer_dict = false;
+    let mut in_inner_dict = false;
+    for line in content[dict_start..].lines() {
+        let trimmed = line.trim();
+        if !in_outer_dict {
+            in_outer_dict = true;
+            continue;
+        }
+        if in_inner_dict {
+            if trimmed.starts_with('}') {
+                in_inner_dict = false;
+                if let Some(name) = current_char.take() {
+                    result.push((name, std::mem::take(&mut current_poses)));
+                }
+            } else if let Some(eq_pos) = trimmed.find(" = \"") {
+                let pose = trimmed[..eq_pos].trim();
+                if !pose.is_empty() {
+                    current_poses.push(pose.to_string());
+                }
+            }
+        } else if trimmed.starts_with('}') {
+            break;
+        } else if let Some(eq_pos) = trimmed.rfind(" = {") {
+            let name = trimmed[..eq_pos].trim();
+            if !name.is_empty() {
+                current_char = Some(name.to_string());
+                current_poses = Vec::new();
+                in_inner_dict = true;
+            }
+        }
+    }
+    result
+}
+
+/// Walks `resources/backgrounds` and converts each image file into the path string NovaScript
+/// expects in a `show`/`trans*` call: relative to `resources/`, no extension, forward slashes
+/// (e.g. `resources/backgrounds/room.png` -> `backgrounds/room`). Used to ground the generation
+/// prompt with real paths and to catch hallucinated paths before spending a Godot reload round trip.
+/// Note: `standings/` is intentionally excluded — character sprites are referenced by pose alias
+/// (see `list_known_character_poses`), not by raw part path, so listing them here would mislead
+/// the model into using paths as pose arguments.
 pub(crate) fn list_known_asset_script_paths(project_dir: &Path) -> Vec<String> {
     let mut paths = Vec::new();
     for root in ASSET_ROOTS {
@@ -162,6 +216,61 @@ pub(crate) fn find_unknown_asset_paths(script: &str, known_paths: &[String], kno
         }
     }
     issues
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CharacterPoseIssue {
+    pub character: String,
+    pub written_pose: String,
+    pub valid_poses: Vec<String>,
+}
+
+/// Checks that every `show(charname, pose, ...)` call where `charname` is a known character uses
+/// a valid pose alias from `character.gd`'s `poses` dictionary, or a literal composite-sprite
+/// string containing `+` (which `character.gd`'s `get_pose` passes through directly without lookup).
+/// Flags calls that use raw `standings/` paths or unrecognized alias names.
+pub(crate) fn find_unknown_character_poses(
+    script: &str,
+    character_poses: &[(String, Vec<String>)],
+) -> Vec<CharacterPoseIssue> {
+    let mut issues = Vec::new();
+    for call_start in find_call_starts(script, "show") {
+        let Some((obj, pose_arg)) = extract_call_args(&script[call_start..], "show") else {
+            continue;
+        };
+        let Some((_, valid_poses)) = character_poses.iter().find(|(name, _)| name == obj) else {
+            continue;
+        };
+        if pose_arg.contains('+') {
+            continue;
+        }
+        if valid_poses.iter().any(|p| p == pose_arg) {
+            continue;
+        }
+        issues.push(CharacterPoseIssue {
+            character: obj.to_string(),
+            written_pose: pose_arg.to_string(),
+            valid_poses: valid_poses.clone(),
+        });
+    }
+    issues
+}
+
+pub fn format_character_pose_issues(issues: &[CharacterPoseIssue]) -> String {
+    let details: Vec<String> = issues
+        .iter()
+        .map(|issue| {
+            let valid = issue.valid_poses.join("/");
+            format!(
+                "show(\"{}\", \"{}\", ...) 用了无效的 pose 别名（路径或不存在的别名），该角色合法的 pose 别名是：{}",
+                issue.character, issue.written_pose, valid
+            )
+        })
+        .collect();
+    format!(
+        "发现角色立绘 pose 别名错误（show 第二个参数必须是 pose 别名，不能是 standings/ 路径）：\n{}",
+        details.join("\n")
+    )
 }
 
 /// `show(obj, image_path, ...)` / `trans*(obj, image_name_or_func, ...)` both put the relevant
@@ -1089,7 +1198,7 @@ pub fn build_generation_prompt(
         9. 默认禁止修改对话台词文本本身（说话人说的话、旁白文字），也不允许新增、删除或合并对话行——除非“用户需求”里明确写出了要修改的具体台词内容，或明确使用了“改台词”“改文本”“改对话”一类的措辞。对话台词以外的部分（背景/灯光/特效 vfx、动画 anim、转场、镜头、音乐音效等函数调用与参数）不受此限制，可以按需修改。\n\
         10. 当用户需求描述的是氛围、情绪、天气、打光、节奏等“演出效果”类诉求（例如“氛围更忧郁一点”“贴合雨天”），必须通过调整或新增 vfx/anim/转场/灯光/环境音等函数调用来实现，绝对不能借此改写台词文字；如果实现该效果确实需要某一行台词配合（极少数情况），必须先确认这正是“用户需求”明确要求的，否则保持台词原样。\n\
         11. `tint`/`env_tint`/`vfx`/`move` 等调用会持久化生效（属性状态不会自动过期），不存在自动“离开场景就还原”的机制。如果本次新增/修改的是这类持久化效果，必须检查“目标文件当前内容”里改动位置之后是否存在切换到不同地点的场景边界（典型信号：之后出现 `trans_fade`/`trans`/`trans_left`/`trans_right`/`trans_up`/`trans_down`，或又一次 `show(\"bg\", 不同路径)` / `show(\"fg\", 不同路径)` 而中间没有先 `hide`/还原）；如果存在这种边界，必须在该边界调用之前补一条还原调用（例如把 `tint` 还原回 `[1,1,1,1]` 或场景原本的色调），避免效果泄漏到下一个不相关的场景。例如：在“学生会办公室”场景加了 `tint(\"bg\", [0.55,0.6,0.68], 0)`，但后面出现了 `trans_fade(\"cam\", func(): show(\"bg\", \"backgrounds/toilet\"), 2)` 切到另一个地点，就必须在这条 `trans_fade` 之前还原 `tint`。如果改动本身已经在文件末尾或后面没有切换到不同地点，则不需要画蛇添足地加还原。同样的道理也适用于场景*内部*的情绪起伏：如果是为了表现冲突升级而逐步加深了某个持久化效果（例如随着对峙升温反复加深 `tint`），在剧情明确出现缓和/转折点（冲突被打断、主角夺回主动权、对方退让等）时，也要让该效果相应地往回收一些，不能任由它只升不降、一路保持到很久之后才在场景末尾一次性清零——效果的强弱要跟着叙事张力的起落走，不是只跟开头/结尾绑定。\n\
-        12. 只能引用真实存在的资源路径：“已知背景/立绘资源路径”列表之外、看起来像是合理猜测但实际不存在的路径（例如把 `backgrounds/room` 简写成 `room`）禁止使用；非角色对象（如 `\"bg\"`/`\"fg\"`）的 `show`/`trans*` 图片路径必须原样取自该列表或当前内容里已经出现过的路径。\n\
+        12. 只能引用真实存在的资源路径：”已知背景资源路径”列表之外、看起来像是合理猜测但实际不存在的路径（例如把 `backgrounds/room` 简写成 `room`）禁止使用；非角色对象（如 bg/fg）的 `show`/`trans*` 图片路径必须原样取自该列表或当前内容里已经出现过的路径；角色对象（如 ergong/gaotian 等绑定名）的 `show` 第二个参数必须是「已知角色 pose 别名」里列出的别名（如 normal/cry），不能使用 standings/ 路径——那是引擎内部的合成图层路径，不是 NovaScript 的 API 参数。\n\
         13. 同理，`play`/`fade_in` 的曲目名必须原样取自“已知音轨”列表里对应 channel 下的曲目；`sound()` 的音效名必须原样取自“已知音效”列表；`vfx()` 的 shader 名必须原样取自“已知 VFX shader”列表。这几类资源都不允许凭语感/常见叫法臆造（例如想要心跳音效但项目里根本没有对应文件，就不要写 `sound(\"heartbeat\", ...)`；想要噪点效果但项目里只有 `noise.gdshaderinc`〔头文件，不能直接用〕没有独立的 `noise.gdshader`，就不要写 `vfx(\"cam\", \"noise\", ...)`）。如果列表里确实没有合适的现成资源，宁可放弃这个细节或换一种已有资源能实现的方案，也不要编一个不存在的名字。\n\
         14. `entry` 参数是 NovaScript 唯一的“排队/排序”机制：同一个 `<| ... |>` block 里的语句是 GDScript 立即顺序执行的，并不会真的等待——`wait(duration)`/`vfx(...)`/`move(...)` 等返回的是一个可以继续往后链的“链尾”，但只有当你把这个返回值显式接住并传给下一步调用的 `entry` 参数时，下一步才会真的排在“等待结束之后”；如果某一步调用的 `wait(...)` 返回值没有被接住传下去，后面那些仍然用默认 `entry`（`o.anim` 根）的调用会和前面的调用同时触发，而不是按你写的先后顺序播放，等于前面的 `wait` 完全没有效果。需要在同一个 block 内对同一个 obj/层先做 A、停顿、再做 B 时，必须像这样显式链接：`var e = vfx(\"cam\", \"glitch\", 0.9, 0.05)\ne = wait(0.05, e)\ne = vfx(\"cam\", \"glitch\", 0, 0.06, null, e)`（可参考 ch4.txt 的 `hold_entry`/`end_entry` 写法）。另外，`vfx(\"cam\", shader_layer, ...)` 在不指定 `layer_id` 时默认都落在 layer 0：如果同一时间窗口内连续对 `\"cam\"` 调用了两个不同的 shader 名而没有用 `[名字, layer_id]` 区分层，后调用的会直接顶替/覆盖前一个绑定在该层的 shader，不会叠加生效——需要同时叠加多个画面特效时要显式分配不同的 layer_id（0~3）。\n\
         15. 立绘横向位置（x 轴）和 scale 的典型参考值——本项目坐标系中 x=0.6 左右已经是刻意制造的「重叠」范围，x 绝对值小于 1 的多人布局会导致立绘明显折叠，应避免。常用布局：单人居中 x=0, scale 约 0.53；两人并排 x 约 -2 和 2，scale 约 0.53；三人 x 约 -2.5/0/2.5；四人 x 约 -3/-1/1/3，scale 约 0.4。从画外进入时惯用 x=4 或 x=-4 作为起始再 move 到目标位置。scale 本身改动要格外谨慎：这类构图效果没法在不实际渲染的情况下被准确验证，大幅提高 scale（比如从 0.53 跳到 1.05）很容易把角色头部推出画面之外。默认以该对象在”目标文件当前内容”里最近一次 show/move 设定的 (x, y, scale) 作为基准，只做小幅调整（变化幅度控制在 30%~40% 以内），除非用户明确要求大幅推近镜头。\n\
@@ -1102,9 +1211,21 @@ pub fn build_generation_prompt(
         sections.push(format!("## 已知角色绑定名\n\n{}", known_characters.join(", ")));
     }
 
+    let character_poses = list_known_character_poses(nova2_project_dir);
+    if !character_poses.is_empty() {
+        let pose_lines: Vec<String> = character_poses
+            .iter()
+            .map(|(char_name, poses)| format!("- {char_name}: {}", poses.join(", ")))
+            .collect();
+        sections.push(format!(
+            "## 已知角色 pose 别名（show(角色绑定名, pose别名) 的第二个参数只能用这些别名，不能用 standings/ 路径）\n\n{}",
+            pose_lines.join("\n")
+        ));
+    }
+
     let known_asset_paths = list_known_asset_script_paths(nova2_project_dir);
     if !known_asset_paths.is_empty() {
-        sections.push(format!("## 已知背景/立绘资源路径\n\n{}", known_asset_paths.join(", ")));
+        sections.push(format!("## 已知背景资源路径\n\n{}", known_asset_paths.join(", ")));
     }
 
     let audio_layout = list_known_audio_layout(nova2_project_dir);
@@ -1290,7 +1411,7 @@ pub fn build_autostage_prompt(
         6. 下面“节点骨架”一节已经搭好了 label/jump_to/is_end/branch 等结构性 eager 调用和节点划分，必须逐字保留——只能在每个 `<| ... |>` 占位块内部把里面的占位注释替换/扩展成真正的演出函数调用，不能修改、删除、移动骨架里的结构性调用或节点划分本身，也不能新增/删除节点。如果某个占位块里除了 TODO 注释外还有一行“演出要求：...”的注释，这是用户写在剧本里、必须满足的具体技术要求（例如指定音乐、动画），必须把它落实成对应的函数调用，不能忽略、不能只当成参考建议自由发挥；占位块里没有这行注释的，才完全由你自行决定演出内容。如果某个占位块的位置被替换成了 `# vvn:seq begin` / `# vvn:seq end` 包裹的内容，这是作者自己手写好的完整演出代码（不是占位符），必须原样保留，一个字符都不能改动，也不能在这两行之间补充、删除或调整任何内容——这部分内容已经是“成品”，不需要你处理，也不允许你处理。\n\
         7. 骨架里每个占位块后面紧跟的一行台词文本必须逐字保留，不能改写、增删、合并或调整顺序——这次任务只是在台词前后补演出，不是改台词。\n\
         8. 只能对“世界状态时间线”里标注为在场的角色对象进行 show/tint/move 等操作；不要凭空引入时间线之外、本次没有登场的角色。背景切换的时机由世界状态时间线里每一拍标注的背景决定——你只负责把对应的 show 调用放在正确的占位块里，不需要、也不能自行决定要不要切换背景、要不要拆分节点；节点划分（label/jump_to/branch 的结构和数量）已经由骨架确定，不是你这一步要考虑的事。\n\
-        9. 只能引用真实存在的资源路径：“已知背景/立绘资源路径”列表之外、看起来像是合理猜测但实际不存在的路径（例如把 `backgrounds/room` 简写成 `room`）禁止使用；非角色对象（如 `\"bg\"`/`\"fg\"`）的 `show`/`trans*` 图片路径必须原样取自该列表，世界状态时间线里标注的背景路径也必须原样使用。\n\
+        9. 只能引用真实存在的资源路径：”已知背景资源路径”列表之外、看起来像是合理猜测但实际不存在的路径（例如把 `backgrounds/room` 简写成 `room`）禁止使用；非角色对象（如 bg/fg）的 `show`/`trans*` 图片路径必须原样取自该列表，世界状态时间线里标注的背景路径也必须原样使用；角色对象（如 ergong/gaotian 等绑定名）的 `show` 第二个参数必须是「已知角色 pose 别名」里列出的别名（如 normal/cry），不能使用 standings/ 路径——那是引擎内部的合成图层路径，不是 NovaScript 的 API 参数。\n\
         10. 同理，`play`/`fade_in` 的曲目名必须原样取自“已知音轨”列表里对应 channel 下的曲目；`sound()` 的音效名必须原样取自“已知音效”列表；`vfx()` 的 shader 名必须原样取自“已知 VFX shader”列表。这几类资源都不允许凭语感/常见叫法臆造。如果列表里确实没有合适的现成资源，宁可放弃这个细节或换一种已有资源能实现的方案，也不要编一个不存在的名字。\n\
         11. `entry` 参数是 NovaScript 唯一的“排队/排序”机制：同一个 `<| ... |>` block 里的语句是 GDScript 立即顺序执行的，并不会真的等待——`wait(duration)`/`vfx(...)`/`move(...)` 等返回的是一个可以继续往后链的“链尾”，但只有当你把这个返回值显式接住并传给下一步调用的 `entry` 参数时，下一步才会真的排在“等待结束之后”；如果某一步调用的 `wait(...)` 返回值没有被接住传下去，后面那些仍然用默认 `entry`（`o.anim` 根）的调用会和前面的调用同时触发，而不是按你写的先后顺序播放，等于前面的 `wait` 完全没有效果。需要在同一个 block 内对同一个 obj/层先做 A、停顿、再做 B 时，必须像这样显式链接：`var e = vfx(\"cam\", \"glitch\", 0.9, 0.05)\ne = wait(0.05, e)\ne = vfx(\"cam\", \"glitch\", 0, 0.06, null, e)`。另外，`vfx(\"cam\", shader_layer, ...)` 在不指定 `layer_id` 时默认都落在 layer 0：需要同时叠加多个画面特效时要显式分配不同的 layer_id（0~3）。\n\
         12. 立绘横向位置（x 轴）和 scale 的典型参考值——本项目坐标系中 x=0.6 左右已经是刻意制造的「重叠」范围，x 绝对值小于 1 的多人布局会导致立绘明显折叠，应避免。常用布局：单人居中 x=0, scale 约 0.53；两人并排 x 约 -2 和 2，scale 约 0.53；三人 x 约 -2.5/0/2.5；四人 x 约 -3/-1/1/3，scale 约 0.4。从画外进入时惯用 x=4 或 x=-4 作为起始再 move 到目标位置。scale 本身的改动要格外谨慎：默认以已知内容里最近一次同类调用设定的 (x, y, scale) 作为基准，只做小幅调整（变化幅度建议控制在 30%~40% 以内），除非确有必要大幅推近镜头。\n\
@@ -1304,9 +1425,21 @@ pub fn build_autostage_prompt(
         sections.push(format!("## 已知角色绑定名\n\n{}", known_characters.join(", ")));
     }
 
+    let character_poses = list_known_character_poses(nova2_project_dir);
+    if !character_poses.is_empty() {
+        let pose_lines: Vec<String> = character_poses
+            .iter()
+            .map(|(char_name, poses)| format!("- {char_name}: {}", poses.join(", ")))
+            .collect();
+        sections.push(format!(
+            "## 已知角色 pose 别名（show(角色绑定名, pose别名) 的第二个参数只能用这些别名，不能用 standings/ 路径）\n\n{}",
+            pose_lines.join("\n")
+        ));
+    }
+
     let known_asset_paths = list_known_asset_script_paths(nova2_project_dir);
     if !known_asset_paths.is_empty() {
-        sections.push(format!("## 已知背景/立绘资源路径\n\n{}", known_asset_paths.join(", ")));
+        sections.push(format!("## 已知背景资源路径\n\n{}", known_asset_paths.join(", ")));
     }
 
     let audio_layout = list_known_audio_layout(nova2_project_dir);
@@ -1674,7 +1807,7 @@ mod tests {
         let prompt = build_autostage_prompt(&dir, "", "ch1.txt", &timeline, &skeleton).unwrap();
 
         assert!(prompt.contains("已知角色绑定名"));
-        assert!(prompt.contains("已知背景/立绘资源路径"));
+        assert!(prompt.contains("已知背景资源路径"));
         assert!(prompt.contains("backgrounds/room"));
 
         fs::remove_dir_all(&dir).ok();

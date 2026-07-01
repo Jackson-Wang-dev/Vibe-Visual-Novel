@@ -8,12 +8,13 @@ mod world_state;
 use generation::{
     apply_lifecycle_autofixes, apply_position_conflict_fixes, build_autostage_prompt,
     build_generation_prompt, build_retry_prompt, build_summary_prompt, check_terminal_closure,
-    check_unclosed_sequences, find_unknown_asset_paths,
+    check_unclosed_sequences, find_unknown_asset_paths, find_unknown_character_poses,
     find_unknown_audio_tracks, find_unknown_shaders, find_unknown_sound_tracks, format_asset_path_issues,
-    format_audio_track_issues, format_lifecycle_issues, format_shader_issues, format_sound_track_issues,
+    format_audio_track_issues, format_character_pose_issues, format_lifecycle_issues,
+    format_shader_issues, format_sound_track_issues,
     format_terminal_closure_issues, format_unclosed_sequence_issues, generate_with_prompt,
     list_known_asset_script_paths, list_known_audio_layout, list_known_character_bind_names,
-    list_known_shader_names, register_new_characters, NewCharacterSpec,
+    list_known_character_poses, list_known_shader_names, register_new_characters, NewCharacterSpec,
 };
 use version_history::VersionInfo;
 use parking_lot::Mutex;
@@ -914,6 +915,7 @@ impl AppRuntime {
 
         let known_asset_paths = list_known_asset_script_paths(nova2_project_dir);
         let known_characters = list_known_character_bind_names(nova2_project_dir);
+        let character_poses = list_known_character_poses(nova2_project_dir);
         let known_audio_layout = list_known_audio_layout(nova2_project_dir);
         let known_shaders = list_known_shader_names(nova2_project_dir);
         let intent_hint = match &mode {
@@ -977,6 +979,7 @@ impl AppRuntime {
             // reload round trip when one fires, and folds every category found into a single
             // retry instead of needing one retry per category.
             let asset_issues = find_unknown_asset_paths(&script, &known_asset_paths, &known_characters);
+            let pose_issues = find_unknown_character_poses(&script, &character_poses);
             let audio_issues = find_unknown_audio_tracks(&script, &known_audio_layout);
             let sound_issues = find_unknown_sound_tracks(&script, &known_audio_layout.one_shot_tracks);
             let shader_issues = find_unknown_shaders(&script, &known_shaders);
@@ -994,6 +997,7 @@ impl AppRuntime {
             // triggered by the real (determinate) failures below, and surface to the author in
             // preview otherwise.
             if !asset_issues.is_empty()
+                || !pose_issues.is_empty()
                 || !audio_issues.is_empty()
                 || !sound_issues.is_empty()
                 || !shader_issues.is_empty()
@@ -1003,6 +1007,9 @@ impl AppRuntime {
                 let mut messages = Vec::new();
                 if !asset_issues.is_empty() {
                     messages.push(format_asset_path_issues(&asset_issues));
+                }
+                if !pose_issues.is_empty() {
+                    messages.push(format_character_pose_issues(&pose_issues));
                 }
                 if !audio_issues.is_empty() {
                     messages.push(format_audio_track_issues(&audio_issues));
