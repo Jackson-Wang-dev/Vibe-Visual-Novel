@@ -737,14 +737,17 @@ pub(crate) fn check_lifecycle_issues(script: &str) -> Vec<LifecycleIssue> {
 }
 
 /// Position slot for a character sprite, bucketed from the x component of show()'s `coord`.
-/// Thresholds are intentionally coarse: a character placed at x=-0.4 and another at x=-0.25
-/// are both "Left" and will trigger conflict detection.
+/// Thresholds calibrated against the project's actual coordinate scale: test_pose.txt shows four
+/// characters placed at x = -3/-1/1/3, and x = ±0.6 is explicitly described as "intentionally
+/// overlapping". So the Left/Center/Right boundaries are at ±1.0, meaning anything inside
+/// (-1.0, 1.0) is "Center". This catches cases like the model placing two characters at x=0.2
+/// and x=0.4 (both Center → conflict) while correctly separating x=-2 and x=2 (Left vs Right).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum PositionSlot { Left, Center, Right }
 
 fn x_to_slot(x: f32) -> PositionSlot {
-    if x < -0.15 { PositionSlot::Left }
-    else if x > 0.15 { PositionSlot::Right }
+    if x < -1.0 { PositionSlot::Left }
+    else if x > 1.0 { PositionSlot::Right }
     else { PositionSlot::Center }
 }
 
@@ -1089,7 +1092,7 @@ pub fn build_generation_prompt(
         12. 只能引用真实存在的资源路径：“已知背景/立绘资源路径”列表之外、看起来像是合理猜测但实际不存在的路径（例如把 `backgrounds/room` 简写成 `room`）禁止使用；非角色对象（如 `\"bg\"`/`\"fg\"`）的 `show`/`trans*` 图片路径必须原样取自该列表或当前内容里已经出现过的路径。\n\
         13. 同理，`play`/`fade_in` 的曲目名必须原样取自“已知音轨”列表里对应 channel 下的曲目；`sound()` 的音效名必须原样取自“已知音效”列表；`vfx()` 的 shader 名必须原样取自“已知 VFX shader”列表。这几类资源都不允许凭语感/常见叫法臆造（例如想要心跳音效但项目里根本没有对应文件，就不要写 `sound(\"heartbeat\", ...)`；想要噪点效果但项目里只有 `noise.gdshaderinc`〔头文件，不能直接用〕没有独立的 `noise.gdshader`，就不要写 `vfx(\"cam\", \"noise\", ...)`）。如果列表里确实没有合适的现成资源，宁可放弃这个细节或换一种已有资源能实现的方案，也不要编一个不存在的名字。\n\
         14. `entry` 参数是 NovaScript 唯一的“排队/排序”机制：同一个 `<| ... |>` block 里的语句是 GDScript 立即顺序执行的，并不会真的等待——`wait(duration)`/`vfx(...)`/`move(...)` 等返回的是一个可以继续往后链的“链尾”，但只有当你把这个返回值显式接住并传给下一步调用的 `entry` 参数时，下一步才会真的排在“等待结束之后”；如果某一步调用的 `wait(...)` 返回值没有被接住传下去，后面那些仍然用默认 `entry`（`o.anim` 根）的调用会和前面的调用同时触发，而不是按你写的先后顺序播放，等于前面的 `wait` 完全没有效果。需要在同一个 block 内对同一个 obj/层先做 A、停顿、再做 B 时，必须像这样显式链接：`var e = vfx(\"cam\", \"glitch\", 0.9, 0.05)\ne = wait(0.05, e)\ne = vfx(\"cam\", \"glitch\", 0, 0.06, null, e)`（可参考 ch4.txt 的 `hold_entry`/`end_entry` 写法）。另外，`vfx(\"cam\", shader_layer, ...)` 在不指定 `layer_id` 时默认都落在 layer 0：如果同一时间窗口内连续对 `\"cam\"` 调用了两个不同的 shader 名而没有用 `[名字, layer_id]` 区分层，后调用的会直接顶替/覆盖前一个绑定在该层的 shader，不会叠加生效——需要同时叠加多个画面特效时要显式分配不同的 layer_id（0~3）。\n\
-        15. 通过 `move`/`show` 的 `coord`（`[x, y, scale, z, angle]`）改变立绘对象的 `scale` 时要格外谨慎：这类构图效果没法在不实际渲染的情况下被准确验证，大幅提高 `scale`（比如从已有的 0.53 跳到 1.05，接近翻倍）很容易把角色的头部/面部推出画面之外。默认应以该对象在“目标文件当前内容”里最近一次 `show`/`move` 设定的 `(x, y, scale)` 作为基准，只做小幅调整（建议相对原 `scale` 的变化幅度控制在 30%~40% 以内），除非用户明确要求大幅推近镜头；如果确实做了较大的 `scale` 调整，必须在你的修改里只做克制的改动，且这类构图改动事后需要用户在预览窗口里确认人物头部是否完整入镜——不要自行假设构图一定正确。\n\
+        15. 立绘横向位置（x 轴）和 scale 的典型参考值——本项目坐标系中 x=0.6 左右已经是刻意制造的「重叠」范围，x 绝对值小于 1 的多人布局会导致立绘明显折叠，应避免。常用布局：单人居中 x=0, scale 约 0.53；两人并排 x 约 -2 和 2，scale 约 0.53；三人 x 约 -2.5/0/2.5；四人 x 约 -3/-1/1/3，scale 约 0.4。从画外进入时惯用 x=4 或 x=-4 作为起始再 move 到目标位置。scale 本身改动要格外谨慎：这类构图效果没法在不实际渲染的情况下被准确验证，大幅提高 scale（比如从 0.53 跳到 1.05）很容易把角色头部推出画面之外。默认以该对象在”目标文件当前内容”里最近一次 show/move 设定的 (x, y, scale) 作为基准，只做小幅调整（变化幅度控制在 30%~40% 以内），除非用户明确要求大幅推近镜头。\n\
         16. `tint`/`env_tint` 绝对不能把 `\"cam\"` 当作 `obj` 使用：这两个函数对非立绘对象固定走 `modulate` 属性（`tint`）或要求对象有 `CurrentPose`（`env_tint`），而 `\"cam\"` 绑定的是 `Camera3D`，没有 `modulate` 属性——`tint(\"cam\", ...)` 在引擎里会直接抛 `NullReferenceException` 崩掉那个 tween，不是警告或静默失败。`tint`/`env_tint` 只能用在 `\"bg\"`/`\"fg\"`/角色立绘对象上。需要给整个镜头/画面叠加颜色（比如“脸色一变、画面泛红”这类需求）时，必须用 `vfx(\"cam\", [\"color\", layer_id], t, duration, { \"_ColorMul\": ... })`（`layer_id` 选一个当前没被占用的 0~3 层，参考规则 14）。".to_string(),
         format!("## NovaScript 参考文档\n\n{reference_text}"),
     ];
@@ -1290,7 +1293,7 @@ pub fn build_autostage_prompt(
         9. 只能引用真实存在的资源路径：“已知背景/立绘资源路径”列表之外、看起来像是合理猜测但实际不存在的路径（例如把 `backgrounds/room` 简写成 `room`）禁止使用；非角色对象（如 `\"bg\"`/`\"fg\"`）的 `show`/`trans*` 图片路径必须原样取自该列表，世界状态时间线里标注的背景路径也必须原样使用。\n\
         10. 同理，`play`/`fade_in` 的曲目名必须原样取自“已知音轨”列表里对应 channel 下的曲目；`sound()` 的音效名必须原样取自“已知音效”列表；`vfx()` 的 shader 名必须原样取自“已知 VFX shader”列表。这几类资源都不允许凭语感/常见叫法臆造。如果列表里确实没有合适的现成资源，宁可放弃这个细节或换一种已有资源能实现的方案，也不要编一个不存在的名字。\n\
         11. `entry` 参数是 NovaScript 唯一的“排队/排序”机制：同一个 `<| ... |>` block 里的语句是 GDScript 立即顺序执行的，并不会真的等待——`wait(duration)`/`vfx(...)`/`move(...)` 等返回的是一个可以继续往后链的“链尾”，但只有当你把这个返回值显式接住并传给下一步调用的 `entry` 参数时，下一步才会真的排在“等待结束之后”；如果某一步调用的 `wait(...)` 返回值没有被接住传下去，后面那些仍然用默认 `entry`（`o.anim` 根）的调用会和前面的调用同时触发，而不是按你写的先后顺序播放，等于前面的 `wait` 完全没有效果。需要在同一个 block 内对同一个 obj/层先做 A、停顿、再做 B 时，必须像这样显式链接：`var e = vfx(\"cam\", \"glitch\", 0.9, 0.05)\ne = wait(0.05, e)\ne = vfx(\"cam\", \"glitch\", 0, 0.06, null, e)`。另外，`vfx(\"cam\", shader_layer, ...)` 在不指定 `layer_id` 时默认都落在 layer 0：需要同时叠加多个画面特效时要显式分配不同的 layer_id（0~3）。\n\
-        12. 通过 `move`/`show` 的 `coord`（`[x, y, scale, z, angle]`）改变立绘对象的 `scale` 时要格外谨慎：默认应以已知内容里最近一次同类调用设定的 `(x, y, scale)` 作为基准，只做小幅调整（建议相对原 `scale` 的变化幅度控制在 30%~40% 以内），除非确有必要大幅推近镜头。\n\
+        12. 立绘横向位置（x 轴）和 scale 的典型参考值——本项目坐标系中 x=0.6 左右已经是刻意制造的「重叠」范围，x 绝对值小于 1 的多人布局会导致立绘明显折叠，应避免。常用布局：单人居中 x=0, scale 约 0.53；两人并排 x 约 -2 和 2，scale 约 0.53；三人 x 约 -2.5/0/2.5；四人 x 约 -3/-1/1/3，scale 约 0.4。从画外进入时惯用 x=4 或 x=-4 作为起始再 move 到目标位置。scale 本身的改动要格外谨慎：默认以已知内容里最近一次同类调用设定的 (x, y, scale) 作为基准，只做小幅调整（变化幅度建议控制在 30%~40% 以内），除非确有必要大幅推近镜头。\n\
         13. `tint`/`env_tint` 绝对不能把 `\"cam\"` 当作 `obj` 使用：`\"cam\"` 绑定的是 `Camera3D`，没有 `modulate` 属性——`tint(\"cam\", ...)` 在引擎里会直接抛异常崩掉那个 tween。`tint`/`env_tint` 只能用在 `\"bg\"`/`\"fg\"`/角色立绘对象上；需要给整个镜头叠加颜色时改用 `vfx(\"cam\", [\"color\", layer_id], t, duration, { \"_ColorMul\": ... })`。\n\
         14. `tint`/`env_tint`/`vfx`/`play` 等持久化效果跨场景边界的收尾，不需要你刻意操心——这部分已经由确定性代码事后扫描并自动修复或单独提示，你只需要专注于这一拍该有的演出本身，不必为了“怕泄漏”而在每个场景末尾画蛇添足地补一堆还原调用。".to_string(),
         format!("## NovaScript 参考文档\n\n{reference_text}"),
@@ -2331,8 +2334,8 @@ mod tests {
 
     #[test]
     fn left_and_right_slots_are_independent() {
-        // xiben left (x=-0.35), ergong right (x=0.35) - no conflict even though both placed.
-        let script = "<|\nshow(\"xiben\", \"normal\", [-0.35, 0, 0.5, 0, 0])\nshow(\"ergong\", \"normal\", [0.35, 0, 0.5, 0, 0])\n|>\n台词。\n\n@<| is_end() |>\n";
+        // xiben left (x=-2), ergong right (x=2) - realistic positions, no conflict.
+        let script = "<|\nshow(\"xiben\", \"normal\", [-2, 0, 0.53, 0, 0])\nshow(\"ergong\", \"normal\", [2, 0, 0.53, 0, 0])\n|>\n台词。\n\n@<| is_end() |>\n";
         let patched = apply_position_conflict_fixes(script);
         assert!(!patched.contains("hide(\"xiben\")"));
         assert!(!patched.contains("hide(\"ergong\")"));
