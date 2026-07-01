@@ -461,6 +461,12 @@ pub fn derive_world_state_timeline(
 pub fn build_node_skeleton(timeline: &WorldStateTimeline, base_label: &str) -> String {
     let mut output = String::new();
     let node_count = timeline.nodes.len();
+    // Tracks whether the very first dialogue moment has been emitted yet, so we can inject the
+    // UI-initialization calls (set_box / set_text_appear) into that moment's placeholder block.
+    // These calls must run before the first dialogue step; they're deterministic requirements,
+    // not creative staging, so the skeleton provides them as pre-filled lines rather than leaving
+    // them for the model to guess.
+    let mut first_moment_emitted = false;
 
     for (node_index, node) in timeline.nodes.iter().enumerate() {
         let label_name = node.name.clone().unwrap_or_else(|| base_label.to_string());
@@ -475,6 +481,13 @@ pub fn build_node_skeleton(timeline: &WorldStateTimeline, base_label: &str) -> S
             match item {
                 NodeItem::Moment(moment) => {
                     output.push_str("<|\n");
+                    if !first_moment_emitted {
+                        // Initialize the dialogue box once, before the first line of text.
+                        // set_box picks the layout ("bottom" is the standard full-width bar);
+                        // set_text_appear sets the typewriter speed (chars/s, interval, fade).
+                        output.push_str("set_box(\"bottom\")\nset_text_appear(2, 30, 0.3)\n");
+                        first_moment_emitted = true;
+                    }
                     if let Some(hint) = &moment.active_hint {
                         output.push_str(&format!("# 演出要求（必须落实成具体函数调用，不能忽略）：{hint}\n"));
                     }
