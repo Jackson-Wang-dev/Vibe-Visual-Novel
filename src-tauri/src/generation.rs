@@ -60,6 +60,54 @@ pub(crate) fn list_known_character_bind_names(project_dir: &Path) -> Vec<String>
         .collect()
 }
 
+/// Scans all `.txt` scenario files for speaker display names (both `DisplayName::dialogue` prefixes
+/// and `auto_voice_on("DisplayName", ...)` call arguments). Used alongside
+/// `list_known_character_bind_names` to populate `GroundingBundle.known_characters` with display
+/// names so that the regularize confirmation view doesn't flag existing speakers as new characters.
+pub(crate) fn list_known_speaker_display_names(project_dir: &Path) -> Vec<String> {
+    let scenarios_dir = project_dir.join("resources").join("scenarios");
+    let Ok(entries) = fs::read_dir(&scenarios_dir) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = Vec::new();
+    for entry in entries.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("txt") {
+            continue;
+        }
+        let Ok(content) = fs::read_to_string(&path) else {
+            continue;
+        };
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty()
+                || trimmed.starts_with('@')
+                || trimmed.starts_with('<')
+                || trimmed.starts_with('#')
+                || trimmed.starts_with("//")
+            {
+                continue;
+            }
+            // Speaker prefix: DisplayName::dialogue
+            if let Some(sep) = trimmed.find("::") {
+                let candidate = trimmed[..sep].trim();
+                if !candidate.is_empty() && !names.iter().any(|n| n == candidate) {
+                    names.push(candidate.to_string());
+                }
+            }
+            // auto_voice_on("DisplayName", ...)
+            for call_start in find_call_starts(trimmed, "auto_voice_on") {
+                if let Some((display_name, _)) = extract_two_quoted_args(&trimmed[call_start..]) {
+                    if !display_name.is_empty() && !names.iter().any(|n| n == display_name) {
+                        names.push(display_name.to_string());
+                    }
+                }
+            }
+        }
+    }
+    names
+}
+
 /// Parses `character.gd`'s static `poses` dictionary to extract valid pose aliases per character.
 /// Returns `(bind_name, [pose_alias, ...])` pairs. Pose aliases are the only valid second argument
 /// to `show(charname, ...)` for composite-sprite character objects — raw part paths like

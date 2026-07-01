@@ -27,8 +27,14 @@ pub struct GroundingBundle {
 impl GroundingBundle {
     pub fn collect(nova2_project_dir: &Path) -> Self {
         let audio_layout = generation::list_known_audio_layout(nova2_project_dir);
+        let mut known_characters = generation::list_known_character_bind_names(nova2_project_dir);
+        for display_name in generation::list_known_speaker_display_names(nova2_project_dir) {
+            if !known_characters.iter().any(|n| n == &display_name) {
+                known_characters.push(display_name);
+            }
+        }
         GroundingBundle {
-            known_characters: generation::list_known_character_bind_names(nova2_project_dir),
+            known_characters,
             known_assets: generation::list_known_asset_script_paths(nova2_project_dir),
             known_audio_channels: audio_layout.channel_tracks,
             known_sound_effects: audio_layout.one_shot_tracks,
