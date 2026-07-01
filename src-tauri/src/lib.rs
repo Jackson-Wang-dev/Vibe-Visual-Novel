@@ -1,15 +1,18 @@
 mod character_template;
 mod generation;
 mod llm;
+mod regularize;
 mod version_history;
+mod world_state;
 
 use generation::{
-    build_generation_prompt, build_retry_prompt,
-    build_summary_prompt, find_unknown_asset_paths, find_unknown_audio_tracks, find_unknown_shaders,
-    find_unknown_sound_tracks, format_asset_path_issues, format_audio_track_issues, format_shader_issues,
-    format_sound_track_issues, generate_with_prompt, list_known_asset_script_paths, list_known_audio_layout,
-    list_known_character_bind_names, list_known_shader_names,
-    register_new_characters, NewCharacterSpec,
+    apply_lifecycle_autofixes, build_autostage_prompt, build_generation_prompt, build_retry_prompt,
+    build_summary_prompt, check_terminal_closure, check_unclosed_sequences, find_unknown_asset_paths,
+    find_unknown_audio_tracks, find_unknown_shaders, find_unknown_sound_tracks, format_asset_path_issues,
+    format_audio_track_issues, format_lifecycle_issues, format_shader_issues, format_sound_track_issues,
+    format_terminal_closure_issues, format_unclosed_sequence_issues, generate_with_prompt,
+    list_known_asset_script_paths, list_known_audio_layout, list_known_character_bind_names,
+    list_known_shader_names, register_new_characters, NewCharacterSpec,
 };
 use version_history::VersionInfo;
 use parking_lot::Mutex;
@@ -222,11 +225,28 @@ struct GenerateRequest {
     target_file: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RegularizeScriptRequest {
+    free_script: String,
+    target_file: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RegularizeScriptResult {
+    marker_text: String,
+    confirmation: regularize::ConfirmationView,
+}
+
 #[derive(Debug, Clone)]
 enum GenerationMode {
     Standard,
     IncrementalTweak {
         preview_state: Option<PreviewBridgeState>,
+    },
+    Autostage {
+        dialogue_only_text: String,
     },
 }
 
@@ -277,7 +297,6 @@ struct SidecarGenerateRequest<'a> {
     user_prompt: &'a str,
     existing_content: &'a str,
     intent_hint: Option<&'a str>,
-    needs_staging_hint: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -760,7 +779,6 @@ impl AppRuntime {
         user_prompt: &str,
         existing_content: &str,
         intent_hint: Option<&str>,
-        needs_staging_hint: Option<bool>,
     ) -> Result<(Vec<NewCharacterSpec>, String), BackendError> {
         let port = self.ensure_sidecar_started().await?;
 
@@ -775,7 +793,6 @@ impl AppRuntime {
                 user_prompt,
                 existing_content,
                 intent_hint,
-                needs_staging_hint,
             })
             .send()
             .await
@@ -804,6 +821,39 @@ impl AppRuntime {
         self.generate_script_with_mode(request, GenerationMode::IncrementalTweak { preview_state }).await
     }
 
+    // AUTOSTAGE reuses `GenerateRequest` as-is rather than a dedicated request type: its
+    // `user_prompt` field carries the dialogue-only NovaScript text to stage (Speaker::text lines,
+    // optionally with `# location:` scene markers), and `target_file` is where the staged result
+    // gets written - same shape, same validate/reload/retry plumbing as every other mode.
+    async fn autostage_inner(&self, request: GenerateRequest) -> Result<GenerateResult, BackendError> {
+        let dialogue_only_text = request.user_prompt.clone();
+        self.generate_script_with_mode(request, GenerationMode::Autostage { dialogue_only_text }).await
+    }
+
+    // The free-form entry point: turns whatever the author actually wrote into marker-language
+    // text (one LLM call, with structural-error retry folded into regularize::regularize_with_retry
+    // itself) and renders a confirmation view from the parsed result. Deliberately does NOT proceed
+    // into AUTOSTAGE's skeleton/fill/validate pipeline here - the author reviews this view first;
+    // once they confirm (no edits needed), the frontend calls the existing `autostage` command with
+    // `marker_text` as its dialogue-only input, exactly as if the author had hand-written the
+    // markers themselves. No new downstream pipeline is needed for that step.
+    async fn regularize_inner(&self, request: RegularizeScriptRequest) -> Result<RegularizeScriptResult, BackendError> {
+        let config = self.get_config();
+        let nova2_project_dir = Path::new(&config.nova2_project_dir);
+        let grounding = regularize::GroundingBundle::collect(nova2_project_dir);
+        let base_label = autostage_label_base(&request.target_file);
+        let api_key = config.deepseek_api_key.clone();
+
+        let (marker_text, timeline) = regularize::regularize_with_retry(&request.free_script, &grounding, &base_label, |prompt| {
+            let api_key = api_key.clone();
+            async move { generation::generate_with_prompt(&prompt, &api_key, llm::DEEPSEEK_MODEL_FLASH).await }
+        })
+        .await?;
+
+        let confirmation = regularize::render_confirmation_view(&timeline, &grounding);
+        Ok(RegularizeScriptResult { marker_text, confirmation })
+    }
+
     async fn generate_script_with_mode(&self, request: GenerateRequest, mode: GenerationMode) -> Result<GenerateResult, BackendError> {
         self.publish_generation_status(
             &request.target_file,
@@ -817,35 +867,58 @@ impl AppRuntime {
         // Empty string (rather than failing) when target_file doesn't exist yet - that's the
         // legitimate "generate a brand new file from scratch" case build_generation_prompt handles.
         let existing_content = self.read_scenario_file(&request.target_file).unwrap_or_default();
-        let mode_context = match &mode {
-            GenerationMode::Standard => None,
-            GenerationMode::IncrementalTweak { preview_state } => Some(build_incremental_tweak_context(
+        // Standard/IncrementalTweak each keep their exact prior code path verbatim in their own
+        // match arm (zero behavior change), while Autostage builds an entirely separate prompt -
+        // no function is shared between the two, so there's no risk of one mode's change leaking
+        // into another's.
+        let base_prompt = match &mode {
+            GenerationMode::Standard => build_generation_prompt(
+                nova2_project_dir,
+                &config.vfx_notes_path,
                 &request.target_file,
-                &request.user_prompt,
                 &existing_content,
-                preview_state.as_ref(),
-            )),
+                &request.user_prompt,
+                None,
+            )?,
+            GenerationMode::IncrementalTweak { preview_state } => {
+                let mut prompt = build_generation_prompt(
+                    nova2_project_dir,
+                    &config.vfx_notes_path,
+                    &request.target_file,
+                    &existing_content,
+                    &request.user_prompt,
+                    None,
+                )?;
+                prompt.push_str("\n\n");
+                prompt.push_str(&build_incremental_tweak_context(
+                    &request.target_file,
+                    &request.user_prompt,
+                    &existing_content,
+                    preview_state.as_ref(),
+                ));
+                prompt
+            }
+            GenerationMode::Autostage { dialogue_only_text } => {
+                let base_label = autostage_label_base(&request.target_file);
+                // Malformed marker structure (a dangling #opt:/#jump: dest, a #branch: with no
+                // options, etc) is caught here, deterministically, before any LLM call is made -
+                // fail fast rather than spending a generation attempt on input that can't possibly
+                // produce a valid skeleton.
+                let timeline = world_state::derive_world_state_timeline(dialogue_only_text, &base_label)
+                    .map_err(|error| BackendError::message(error.describe()))?;
+                let skeleton = world_state::build_node_skeleton(&timeline, &base_label);
+                build_autostage_prompt(nova2_project_dir, &config.vfx_notes_path, &request.target_file, &timeline, &skeleton)?
+            }
         };
-        let mut base_prompt = build_generation_prompt(
-            nova2_project_dir,
-            &config.vfx_notes_path,
-            &request.target_file,
-            &existing_content,
-            &request.user_prompt,
-            None,
-        )?;
-        if let Some(context) = mode_context {
-            base_prompt.push_str("\n\n");
-            base_prompt.push_str(&context);
-        }
 
         let known_asset_paths = list_known_asset_script_paths(nova2_project_dir);
         let known_characters = list_known_character_bind_names(nova2_project_dir);
         let known_audio_layout = list_known_audio_layout(nova2_project_dir);
         let known_shaders = list_known_shader_names(nova2_project_dir);
-        let (intent_hint, needs_staging_hint) = match &mode {
-            GenerationMode::Standard => (None, None),
-            GenerationMode::IncrementalTweak { .. } => (Some("incremental_tweak"), Some(false)),
+        let intent_hint = match &mode {
+            GenerationMode::Standard => None,
+            GenerationMode::IncrementalTweak { .. } => Some("incremental_tweak"),
+            GenerationMode::Autostage { .. } => Some("from_scratch"),
         };
         self.publish_generation_status(
             &request.target_file,
@@ -878,9 +951,13 @@ impl AppRuntime {
                     &request.user_prompt,
                     &existing_content,
                     intent_hint,
-                    needs_staging_hint,
                 )
                 .await?;
+            // Mechanical leaks (tint/env_tint/vfx left open, audio still playing across a scene
+            // boundary) get patched in directly here, for free - no model round trip needed since
+            // the "closed" value is unambiguous. This happens before validation/write so every
+            // downstream step (asset checks, draft write, reload) sees the patched script.
+            let (script, lifecycle_issues) = apply_lifecycle_autofixes(&script);
             register_new_characters(nova2_project_dir, &new_chars)?;
             self.write_scenario_file_draft(&request.target_file, &script)?;
             final_script = script.clone();
@@ -901,7 +978,19 @@ impl AppRuntime {
             let audio_issues = find_unknown_audio_tracks(&script, &known_audio_layout);
             let sound_issues = find_unknown_sound_tracks(&script, &known_audio_layout.one_shot_tracks);
             let shader_issues = find_unknown_shaders(&script, &known_shaders);
-            if !asset_issues.is_empty() || !audio_issues.is_empty() || !sound_issues.is_empty() || !shader_issues.is_empty() {
+            let closure_issues = check_terminal_closure(&script);
+            // Only ever non-empty for scripts containing AUTOSTAGE's `# vvn:seq begin/end`
+            // sentinel markers (or a human who hand-typed them into an EDIT-mode script, which
+            // deserves the same flag) - a harmless no-op for every other script.
+            let unclosed_sequence_issues = check_unclosed_sequences(&script);
+            if !asset_issues.is_empty()
+                || !audio_issues.is_empty()
+                || !sound_issues.is_empty()
+                || !shader_issues.is_empty()
+                || !lifecycle_issues.is_empty()
+                || !closure_issues.is_empty()
+                || !unclosed_sequence_issues.is_empty()
+            {
                 let mut messages = Vec::new();
                 if !asset_issues.is_empty() {
                     messages.push(format_asset_path_issues(&asset_issues));
@@ -914,6 +1003,15 @@ impl AppRuntime {
                 }
                 if !shader_issues.is_empty() {
                     messages.push(format_shader_issues(&shader_issues));
+                }
+                if !lifecycle_issues.is_empty() {
+                    messages.push(format_lifecycle_issues(&lifecycle_issues));
+                }
+                if !closure_issues.is_empty() {
+                    messages.push(format_terminal_closure_issues(&closure_issues));
+                }
+                if !unclosed_sequence_issues.is_empty() {
+                    messages.push(format_unclosed_sequence_issues(&unclosed_sequence_issues));
                 }
                 let error = PreviewBridgeError {
                     message: messages.join("；"),
@@ -1349,6 +1447,28 @@ async fn incremental_tweak(runtime: State<'_, AppRuntime>, request: GenerateRequ
         .await
         .map_err(|error| error.to_bridge_error())
 }
+#[tauri::command]
+async fn autostage(runtime: State<'_, AppRuntime>, request: GenerateRequest) -> Result<GenerateResult, PreviewBridgeError> {
+    runtime.autostage_inner(request).await.map_err(|error| error.to_bridge_error())
+}
+
+#[tauri::command]
+async fn regularize_script(
+    runtime: State<'_, AppRuntime>,
+    request: RegularizeScriptRequest,
+) -> Result<RegularizeScriptResult, PreviewBridgeError> {
+    runtime.regularize_inner(request).await.map_err(|error| error.to_bridge_error())
+}
+
+/// Derives the skeleton's main-node label from the target file name (eg. `ch1.txt` ->
+/// `ch1_autostage`), so the label stays readable and collisions with hand-written labels elsewhere
+/// in the project are unlikely without needing any extra user input. Named nodes declared via
+/// `#node:` in the dialogue-only input use their own literal name instead - this is only the main
+/// (unnamed) node's label.
+fn autostage_label_base(target_file: &str) -> String {
+    let stem = Path::new(target_file).file_stem().and_then(|stem| stem.to_str()).unwrap_or("autostage");
+    format!("{stem}_autostage")
+}
 
 fn build_incremental_tweak_context(
     target_file: &str,
@@ -1397,6 +1517,8 @@ pub fn run() {
             generate_script_cmd,
             generate_script_with_retry,
             incremental_tweak,
+            autostage,
+            regularize_script,
             get_project_session,
             leave_project,
             get_runtime_status,

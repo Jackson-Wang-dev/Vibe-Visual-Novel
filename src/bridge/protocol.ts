@@ -36,6 +36,28 @@ export type GenerateResult = {
   lastError?: PreviewBridgeError;
   summary: string;
 };
+export type ConfirmationBeatView = {
+  text: string;
+  speaker?: string;
+  background?: string;
+  onStage: string[];
+  hint?: string;
+};
+export type ConfirmationNodeView = {
+  name?: string;
+  beats: ConfirmationBeatView[];
+  hasHandwrittenContent: boolean;
+  terminatorSummary: string;
+};
+export type ConfirmationView = {
+  nodes: ConfirmationNodeView[];
+  newCharacters: string[];
+  unresolvedResources: string[];
+};
+export type RegularizeScriptResult = {
+  markerText: string;
+  confirmation: ConfirmationView;
+};
 export type VersionInfo = {
   id: string;
   timestampMs: number;

@@ -178,6 +178,56 @@ label {
   color: #97aac7;
 }
 
+.field-hint {
+  font-size: 0.78rem;
+  color: #6f83a3;
+  margin-top: 4px;
+}
+
+.regularize-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(8, 12, 20, 0.72);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 32px 16px;
+  overflow-y: auto;
+  z-index: 50;
+}
+
+.regularize-panel {
+  width: min(720px, 100%);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.regularize-confirmation {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  padding-top: 12px;
+}
+
+.regularize-node {
+  background: rgba(255, 255, 255, 0.03);
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+
+.regularize-beat-list {
+  margin: 6px 0 0;
+  padding-left: 18px;
+  font-size: 0.88rem;
+}
+
+.regularize-flag {
+  color: #e0a458;
+  font-size: 0.85rem;
+}
+
 .panel-header {
   display: flex;
   justify-content: space-between;

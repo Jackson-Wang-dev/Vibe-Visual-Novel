@@ -7,6 +7,7 @@ import type {
   PreviewBridgeError,
   PreviewBridgeState,
   ProjectSession,
+  RegularizeScriptResult,
   ScenarioFile,
   StateChangedEvent,
   SummaryReadyEvent,
@@ -121,6 +122,27 @@ export class PreviewBridgeClient {
   async incrementalTweak(userPrompt: string, targetFile: string): Promise<GenerateResult> {
     return invoke<GenerateResult>("incremental_tweak", {
       request: { userPrompt, targetFile },
+    });
+  }
+
+  // AUTOSTAGE reuses the same GenerateRequest shape as the other generation modes - dialogueOnlyText
+  // travels in the userPrompt field (see autostage_inner in lib.rs), since the backend's
+  // GenerateRequest has no dedicated field for it and adding one would mean a second request type
+  // for what's otherwise an identical { userPrompt, targetFile } shape.
+  async autostage(dialogueOnlyText: string, targetFile: string): Promise<GenerateResult> {
+    return invoke<GenerateResult>("autostage", {
+      request: { userPrompt: dialogueOnlyText, targetFile },
+    });
+  }
+
+  // Free-form entry point: turns whatever the author actually wrote into marker-language text
+  // (one LLM call, with structural-error retry handled entirely on the Rust side) and returns a
+  // human-readable confirmation view alongside the underlying marker text. The marker text is
+  // never shown to the author directly - once they confirm the view, pass `markerText` straight
+  // into `autostage()` above as if they'd hand-written the markers themselves.
+  async regularizeScript(freeScript: string, targetFile: string): Promise<RegularizeScriptResult> {
+    return invoke<RegularizeScriptResult>("regularize_script", {
+      request: { freeScript, targetFile },
     });
   }
 

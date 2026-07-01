@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { previewBridgeClient, type AppConfig, type RuntimeStatus } from "./bridge/PreviewBridgeClient";
 import type {
   AssetFile,
+  ConfirmationView,
   GenerateResult,
   PreviewBridgeError,
   PreviewBridgeState,
@@ -43,6 +44,24 @@ type GeneratePanelState = {
   userPrompt: string;
   targetFile: string;
   result: GenerateResult | null;
+};
+
+type RegularizeState = {
+  isOpen: boolean;
+  isLoading: boolean;
+  freeScript: string;
+  markerText: string;
+  view: ConfirmationView | null;
+  correctionNote: string;
+};
+
+const emptyRegularizeState: RegularizeState = {
+  isOpen: false,
+  isLoading: false,
+  freeScript: "",
+  markerText: "",
+  view: null,
+  correctionNote: "",
 };
 
 const emptyState: PreviewBridgeState = {
@@ -89,6 +108,7 @@ function App() {
   const [bridgeState, setBridgeState] = useState<PreviewBridgeState>(emptyState);
   const [runtimeStatus, setRuntimeStatus] = useState<RuntimeStatus | null>(null);
   const [seekDraft, setSeekDraft] = useState<SeekDraft>({ nodeRecordId: "1", dialogueIndex: "0" });
+  const [regularizeState, setRegularizeState] = useState<RegularizeState>(emptyRegularizeState);
   const [generatePanel, setGeneratePanel] = useState<GeneratePanelState>({
     userPrompt: "",
     targetFile: "",
@@ -599,6 +619,79 @@ function App() {
     }
   };
 
+  const runAutostage = async (dialogueOnlyText: string) => {
+    if (!generatePanel.targetFile.trim()) {
+      applyError({ message: "请先选择 target_file" }, "AUTOSTAGE 失败");
+      return;
+    }
+    setIsGeneratingScript(true);
+    setAgentStepIndex(0);
+    setGeneratePanel((current) => ({ ...current, result: null }));
+    setStatusTone("busy");
+    setStatusTitle("正在自动补全演出（AUTOSTAGE）");
+    setStatusMessage(`会把纯对话台词搭好节点骨架，再让 AI 在骨架内填充演出，结果写回 ${generatePanel.targetFile}。`);
+    setLastError(null);
+    try {
+      const result = await previewBridgeClient.autostage(dialogueOnlyText, generatePanel.targetFile);
+      setGeneratePanel((current) => ({ ...current, result }));
+      if (result.applied) {
+        await loadScriptContent(generatePanel.targetFile);
+        await refreshRuntimeStatus();
+        setStatusTone("success");
+        setStatusTitle("AUTOSTAGE 完成并已应用");
+        setStatusMessage(`已在第 ${result.attempts} 次尝试后成功 reload。请先看游戏窗口验证演出效果。`);
+      } else {
+        setStatusTone("error");
+        setStatusTitle("AUTOSTAGE 未通过引擎校验");
+        setStatusMessage(`已尝试 ${result.attempts} 次，但最终 reload 仍失败。脚本草稿保留在结果面板中供检查。`);
+        setLastError(result.lastError ?? null);
+      }
+    } catch (error) {
+      applyUnknownError(error, "AUTOSTAGE 失败");
+    } finally {
+      setIsGeneratingScript(false);
+    }
+  };
+
+  const handleAutostage = () => runAutostage(generatePanel.userPrompt);
+
+  const handleOpenRegularize = () => {
+    setRegularizeState({ ...emptyRegularizeState, isOpen: true, freeScript: generatePanel.userPrompt });
+  };
+
+  const handleCloseRegularize = () => {
+    setRegularizeState(emptyRegularizeState);
+  };
+
+  const handleRunRegularize = async (correctionNote?: string) => {
+    if (!generatePanel.targetFile.trim()) {
+      applyError({ message: "请先选择 target_file" }, "自由剧本理解失败");
+      return;
+    }
+    if (!regularizeState.freeScript.trim()) {
+      applyError({ message: "请先粘贴自由格式的剧本" }, "自由剧本理解失败");
+      return;
+    }
+    setRegularizeState((current) => ({ ...current, isLoading: true }));
+    setLastError(null);
+    try {
+      const scriptToSend = correctionNote
+        ? `${regularizeState.freeScript}\n\n【补充修正说明，请据此重新理解上面的剧本】\n${correctionNote}`
+        : regularizeState.freeScript;
+      const result = await previewBridgeClient.regularizeScript(scriptToSend, generatePanel.targetFile);
+      setRegularizeState((current) => ({ ...current, isLoading: false, markerText: result.markerText, view: result.confirmation, correctionNote: "" }));
+    } catch (error) {
+      setRegularizeState((current) => ({ ...current, isLoading: false }));
+      applyUnknownError(error, "自由剧本理解失败");
+    }
+  };
+
+  const handleConfirmRegularize = async () => {
+    const markerText = regularizeState.markerText;
+    handleCloseRegularize();
+    await runAutostage(markerText);
+  };
+
   return (
     <main className={`app-shell ${hasProject ? "app-shell-project" : "app-shell-empty"}`}>
       <button
@@ -778,6 +871,10 @@ function App() {
                     }}
                     placeholder="例如：把当前预览附近的对话改得更克制，增加停顿感，并把背景切到夜晚教室。"
                   />
+                  <span className="field-hint">
+                    用“AUTOSTAGE 补全演出”时，这里改填纯对话台词（每行 `显示名::台词`）。场景切换用 `#loc: 背景路径` 单独一行标注；想给某一拍指定具体要求（用什么音乐/动画等），用
+                    `#hnt: 要求内容` 单独一行标注，这条要求会一直生效到下一个 `#loc:` 或下一个 `#hnt:`（写 `#hnt:` 不带内容可以提前清除）；其余以 `#` 开头但不是这两种的行会被当成注释直接忽略。AI 只负责在搭好的节点骨架里补演出，不会改动台词本身。
+                  </span>
                 </label>
                 <div className="ai-inline-grid">
                   <label>
@@ -816,6 +913,24 @@ function App() {
                       }
                     >
                       微调当前预览
+                    </button>
+                    <button
+                      type="button"
+                      className="secondary-button"
+                      onClick={handleAutostage}
+                      disabled={isGeneratingScript || isLoadingProject || isHydrating || !generatePanel.userPrompt.trim()}
+                      title="文本框需要是纯对话台词（显示名::台词），场景切换用 #loc: 背景路径 标注，具体要求用 #hnt: 要求内容 标注（持续生效到下一个 #loc/#hnt）；AI 只填演出，不改台词"
+                    >
+                      AUTOSTAGE 补全演出
+                    </button>
+                    <button
+                      type="button"
+                      className="secondary-button"
+                      onClick={handleOpenRegularize}
+                      disabled={isGeneratingScript || isLoadingProject || isHydrating}
+                      title="怎么写都行——剧本/大纲/对话随便贴，AI 先理解成结构，给你看一遍确认稿，你确认后再进入 AUTOSTAGE"
+                    >
+                      AUTOSTAGE（自由剧本）
                     </button>
                   </div>
                 </div>
@@ -1121,6 +1236,93 @@ function App() {
           </section>
         </section>
       )}
+      {regularizeState.isOpen ? (
+        <div className="regularize-overlay">
+          <div className="card regularize-panel">
+            <div className="panel-header">
+              <h2>AUTOSTAGE（自由剧本）</h2>
+              <button type="button" className="secondary-button compact-button" onClick={handleCloseRegularize}>
+                关闭
+              </button>
+            </div>
+            <p className="editor-hint">
+              怎么写都行——大纲、对话、舞台指示混在一起也没关系。AI 只做“理解 + 规整”这一次调用，下面会给你看一份它理解出来的人话确认稿；确认无误（或改完确认说明重新理解）之后才会真正进入
+              AUTOSTAGE 补全演出。
+            </p>
+            <label>
+              <span className="field-label">自由格式剧本原文</span>
+              <textarea
+                className="prompt-textarea"
+                value={regularizeState.freeScript}
+                onChange={(event) => {
+                  const value = event.currentTarget.value;
+                  setRegularizeState((current) => ({ ...current, freeScript: value, view: null, markerText: "" }));
+                }}
+                placeholder={"例如：\n画面淡入到教室。\n小王走了进来。\n小王::早啊。\nOPTION1：打个招呼\nOPTION2：装作没看见\n如选择option1，则//变量m变为1"}
+              />
+            </label>
+            <button type="button" onClick={() => handleRunRegularize()} disabled={regularizeState.isLoading || !regularizeState.freeScript.trim()}>
+              {regularizeState.isLoading ? "理解中..." : regularizeState.view ? "重新理解" : "开始理解"}
+            </button>
+
+            {regularizeState.view ? (
+              <div className="regularize-confirmation">
+                <h3>确认稿</h3>
+                {regularizeState.view.nodes.map((node, nodeIndex) => (
+                  <div key={nodeIndex} className="regularize-node">
+                    <strong>节点：{node.name ?? "主节点"}</strong>
+                    <ul className="regularize-beat-list">
+                      {node.beats.map((beat, beatIndex) => (
+                        <li key={beatIndex}>
+                          {beat.speaker ? `${beat.speaker}：` : ""}
+                          {beat.text}
+                          {beat.background ? `（背景：${beat.background}）` : ""}
+                          {beat.onStage.length > 0 ? `（在场：${beat.onStage.join("、")}）` : ""}
+                          {beat.hint ? `（要求：${beat.hint}）` : ""}
+                        </li>
+                      ))}
+                    </ul>
+                    {node.hasHandwrittenContent ? <p className="editor-hint">（这个节点里还有一段作者手写的演出内容，原样保留，不在这里展示）</p> : null}
+                    <p className="editor-hint">收尾：{node.terminatorSummary === "结束" ? "结束" : node.terminatorSummary}</p>
+                  </div>
+                ))}
+                {regularizeState.view.newCharacters.length > 0 ? (
+                  <p className="regularize-flag">新角色（清单里没有，需要你确认/指派）：{regularizeState.view.newCharacters.join("、")}</p>
+                ) : null}
+                {regularizeState.view.unresolvedResources.length > 0 ? (
+                  <p className="regularize-flag">无法识别的资源路径：{regularizeState.view.unresolvedResources.join("、")}</p>
+                ) : null}
+
+                <label>
+                  <span className="field-label">如果理解有误，写一句修正说明再重新理解（不改这里就直接确认即可）</span>
+                  <textarea
+                    className="prompt-textarea"
+                    value={regularizeState.correctionNote}
+                    onChange={(event) => {
+                      const value = event.currentTarget.value;
+                      setRegularizeState((current) => ({ ...current, correctionNote: value }));
+                    }}
+                    placeholder="例如：小王这个角色其实就是已知角色里的“王浩然”，请重新理解"
+                  />
+                </label>
+                <div className="ai-action-stack">
+                  <button type="button" onClick={handleConfirmRegularize} disabled={isGeneratingScript}>
+                    确认并继续 AUTOSTAGE
+                  </button>
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    onClick={() => handleRunRegularize(regularizeState.correctionNote)}
+                    disabled={regularizeState.isLoading || !regularizeState.correctionNote.trim()}
+                  >
+                    按修正说明重新理解
+                  </button>
+                </div>
+              </div>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
     </main>
   );
 }

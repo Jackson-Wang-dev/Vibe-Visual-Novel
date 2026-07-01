@@ -1,6 +1,6 @@
-use crate::{character_template, llm, BackendError, PreviewBridgeError};
+use crate::{character_template, llm, world_state, BackendError, PreviewBridgeError};
 use serde::Deserialize;
-use std::{fs, path::Path};
+use std::{collections::HashMap, fs, path::Path};
 
 #[cfg(test)]
 const NEW_CHARS_PREFIX: &str = "#NEWCHARS:";
@@ -370,6 +370,517 @@ pub(crate) fn find_unknown_shaders(script: &str, known_shaders: &[String]) -> Ve
     issues
 }
 
+const SCENE_BOUNDARY_CALLS: [&str; 7] = ["trans_fade", "trans_left", "trans_right", "trans_up", "trans_down", "trans2", "trans"];
+const AUDIO_OPEN_CALLS: [&str; 2] = ["play", "fade_in"];
+const AUDIO_CLOSE_CALLS: [&str; 2] = ["stop", "fade_out"];
+
+/// Finds every occurrence of `marker` as a literal substring in `script`, returning the byte
+/// offset of the start of each match - for the `# vvn:seq begin`/`# vvn:seq end` sentinel comments
+/// `build_node_skeleton` emits, which aren't function calls, so `find_call_starts`' identifier-
+/// boundary guard doesn't apply and isn't needed (these are whole-line sentinels only AUTOSTAGE's
+/// own skeleton builder emits, not user-writable identifiers that could collide).
+fn find_marker_lines(script: &str, marker: &str) -> Vec<usize> {
+    let mut offsets = Vec::new();
+    let mut search_from = 0;
+    while let Some(found) = script[search_from..].find(marker) {
+        offsets.push(search_from + found);
+        search_from += found + marker.len();
+    }
+    offsets
+}
+
+/// What kind of persistent state a `LifecycleIssue` is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LifecycleCallKind {
+    Tint,
+    EnvTint,
+    Vfx,
+    Audio,
+    Show,
+}
+
+/// One piece of state that was still "open" (shown/tinted/playing/etc) at a scene boundary (or
+/// EOF) without being closed/reverted first - the exact failure mode rule 11's prose asks the
+/// model to self-police and consistently fails to. `auto_fix` is `Some(line to insert)` for the
+/// mechanical cases (tint/env_tint/vfx/audio all have one unambiguous "closed" value); it's `None`
+/// for `Show`, since whether a character/object should still be on screen in the next scene is a
+/// content judgment, not something code should silently decide.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LifecycleIssue {
+    pub object: String,
+    pub call_kind: LifecycleCallKind,
+    pub opened_at_line: u32,
+    pub boundary_line: u32,
+    pub boundary_kind: &'static str,
+    pub auto_fix: Option<String>,
+}
+
+enum LifecycleEvent {
+    Show { obj: String, is_bg_or_fg: bool, path: Option<String> },
+    Hide { obj: String },
+    Tint { obj: String, is_default: bool },
+    EnvTint { obj: String, is_default: bool },
+    Vfx { obj: String, layer: u32, is_clear: bool },
+    AudioOpen { channel: String },
+    AudioClose { channel: String },
+    Boundary { kind: &'static str },
+    /// A `# vvn:seq begin`/`# vvn:seq end` sentinel comment, emitted only by `build_node_skeleton`
+    /// around a `#seq:`-marked performance-sequence span's raw passthrough content. While inside
+    /// such a span, ordinary scene-boundary detection (trans* calls, bg/fg path switches) is
+    /// suppressed entirely - rapid background switching IS the performance there, not a leak - and
+    /// the span's end is the sole cleanup boundary.
+    SequenceBoundary { is_start: bool },
+}
+
+fn byte_offset_to_line(script: &str, offset: usize) -> u32 {
+    let clamped = offset.min(script.len());
+    script[..clamped].matches('\n').count() as u32 + 1
+}
+
+/// `vfx("cam", ...)` has 4 independent layers (0-3, see novascript-reference.md's VFX layer
+/// section); every other target has a single slot, always layer 0. Layer-qualifying only `"cam"`
+/// in the reported object name keeps single-slot objects' messages simple while still letting two
+/// different `"cam"` layers be reported as the distinct issues they are.
+fn vfx_object_label(obj: &str, layer: u32) -> String {
+    if obj == "cam" {
+        format!("{obj}:{layer}")
+    } else {
+        obj.to_string()
+    }
+}
+
+/// `tint`/`env_tint`'s neutral/reverted color is white, fully opaque - `[1,1,1,1]` - but the
+/// `color` argument's shorthand forms (scalar, `[gray]`, `[gray,alpha]`, `[r,g,b]`, `[r,g,b,a]`)
+/// mean a literal "is this exactly `[1,1,1,1]`" string compare would miss `1`, `[1,1,1]`, etc.
+/// Treats any argument that, once brackets are stripped, is a comma-separated list of nothing but
+/// `1`/`1.0`/`1.00` tokens as "already reverted to default".
+fn looks_like_default_color(color_arg: &str) -> bool {
+    let cleaned = color_arg.trim().trim_start_matches('[').trim_end_matches(']');
+    if cleaned.is_empty() {
+        return false;
+    }
+    cleaned.split(',').all(|token| matches!(token.trim(), "1" | "1.0" | "1.00"))
+}
+
+/// Like `extract_call_args`, but for calls whose 2nd positional argument is an arbitrary
+/// expression (e.g. `tint`/`env_tint`'s `[r,g,b,a]` color array) rather than a quoted string.
+/// Tracks bracket/paren depth so a comma inside `[...]` isn't mistaken for the argument separator.
+fn extract_color_arg(rest: &str) -> Option<(&str, &str)> {
+    let (obj, after_obj) = extract_quoted_arg(rest)?;
+    let after_comma = after_obj.trim_start().strip_prefix(',')?.trim_start();
+    let mut depth: i32 = 0;
+    for (index, ch) in after_comma.char_indices() {
+        match ch {
+            '[' | '(' => depth += 1,
+            ']' | ')' if depth > 0 => depth -= 1,
+            ')' if depth == 0 => return Some((obj, after_comma[..index].trim())),
+            ',' if depth == 0 => return Some((obj, after_comma[..index].trim())),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn parse_layer_id(rest: &str) -> Option<u32> {
+    let after_comma = rest.trim_start().strip_prefix(',')?;
+    let digits: String = after_comma.trim_start().chars().take_while(|ch| ch.is_ascii_digit()).collect();
+    digits.parse().ok()
+}
+
+/// Parses `vfx(obj, shader_layer, ...)`'s 2nd argument into `(shader_name_or_None_if_clearing,
+/// layer_id)`. `shader_layer` can be a bare shader name (layer 0), `[shader_name, layer_id]`,
+/// `null` (clears layer 0), or `[null, layer_id]` (clears that specific cam layer).
+fn extract_vfx_args(rest: &str) -> Option<(&str, Option<&str>, u32)> {
+    let (obj, after_obj) = extract_quoted_arg(rest)?;
+    let after_comma = after_obj.trim_start().strip_prefix(',')?.trim_start();
+    if let Some(array_rest) = after_comma.strip_prefix('[') {
+        let array_rest = array_rest.trim_start();
+        if let Some(after_null) = array_rest.strip_prefix("null") {
+            return Some((obj, None, parse_layer_id(after_null).unwrap_or(0)));
+        }
+        let (shader_name, after_shader) = extract_quoted_arg(array_rest)?;
+        return Some((obj, Some(shader_name), parse_layer_id(after_shader).unwrap_or(0)));
+    }
+    if after_comma.starts_with("null") {
+        return Some((obj, None, 0));
+    }
+    let (shader_name, _) = extract_quoted_arg(after_comma)?;
+    Some((obj, Some(shader_name), 0))
+}
+
+fn collect_lifecycle_events(script: &str) -> Vec<(usize, LifecycleEvent)> {
+    let mut events: Vec<(usize, LifecycleEvent)> = Vec::new();
+
+    for call_start in find_call_starts(script, "show") {
+        if let Some((obj, path)) = extract_call_args(&script[call_start..], "show") {
+            let is_bg_or_fg = obj == "bg" || obj == "fg";
+            events.push((call_start, LifecycleEvent::Show { obj: obj.to_string(), is_bg_or_fg, path: Some(path.to_string()) }));
+        }
+    }
+    for call_start in find_call_starts(script, "hide") {
+        if let Some((obj, _)) = extract_quoted_arg(&script[call_start..]) {
+            events.push((call_start, LifecycleEvent::Hide { obj: obj.to_string() }));
+        }
+    }
+    for call_start in find_call_starts(script, "tint") {
+        if let Some((obj, color)) = extract_color_arg(&script[call_start..]) {
+            events.push((call_start, LifecycleEvent::Tint { obj: obj.to_string(), is_default: looks_like_default_color(color) }));
+        }
+    }
+    for call_start in find_call_starts(script, "env_tint") {
+        if let Some((obj, color)) = extract_color_arg(&script[call_start..]) {
+            events.push((call_start, LifecycleEvent::EnvTint { obj: obj.to_string(), is_default: looks_like_default_color(color) }));
+        }
+    }
+    for call_start in find_call_starts(script, "vfx") {
+        if let Some((obj, shader, layer)) = extract_vfx_args(&script[call_start..]) {
+            events.push((call_start, LifecycleEvent::Vfx { obj: obj.to_string(), layer, is_clear: shader.is_none() }));
+        }
+    }
+    for call_name in AUDIO_OPEN_CALLS {
+        for call_start in find_call_starts(script, call_name) {
+            if let Some((channel, _)) = extract_two_quoted_args(&script[call_start..]) {
+                events.push((call_start, LifecycleEvent::AudioOpen { channel: channel.to_string() }));
+            }
+        }
+    }
+    for call_name in AUDIO_CLOSE_CALLS {
+        for call_start in find_call_starts(script, call_name) {
+            if let Some((channel, _)) = extract_quoted_arg(&script[call_start..]) {
+                events.push((call_start, LifecycleEvent::AudioClose { channel: channel.to_string() }));
+            }
+        }
+    }
+    for call_name in SCENE_BOUNDARY_CALLS {
+        for call_start in find_call_starts(script, call_name) {
+            events.push((call_start, LifecycleEvent::Boundary { kind: call_name }));
+        }
+    }
+    for offset in find_marker_lines(script, world_state::SEQUENCE_BEGIN_MARKER) {
+        events.push((offset, LifecycleEvent::SequenceBoundary { is_start: true }));
+    }
+    for offset in find_marker_lines(script, world_state::SEQUENCE_END_MARKER) {
+        events.push((offset, LifecycleEvent::SequenceBoundary { is_start: false }));
+    }
+
+    events.sort_by_key(|(offset, _)| *offset);
+    events
+}
+
+/// Emits a `LifecycleIssue` for everything still open at this boundary, then drains the
+/// mechanical maps (tint/env_tint/vfx/audio - the boundary is assumed fixed going forward, whether
+/// by auto-fix or by the model acting on feedback) while leaving `show_open` untouched, since
+/// "is this object still supposed to be on screen" needs re-evaluating at every boundary it's
+/// still open at, not just the first one.
+fn flush_lifecycle_boundary(
+    line: u32,
+    kind: &'static str,
+    tint_open: &mut HashMap<String, u32>,
+    env_tint_open: &mut HashMap<String, u32>,
+    vfx_open: &mut HashMap<(String, u32), u32>,
+    audio_open: &mut HashMap<String, u32>,
+    show_open: &HashMap<String, u32>,
+    issues: &mut Vec<LifecycleIssue>,
+) {
+    for (obj, opened_at_line) in tint_open.drain() {
+        issues.push(LifecycleIssue {
+            auto_fix: Some(format!("tint(\"{obj}\", [1,1,1,1], 0)")),
+            object: obj,
+            call_kind: LifecycleCallKind::Tint,
+            opened_at_line,
+            boundary_line: line,
+            boundary_kind: kind,
+        });
+    }
+    for (obj, opened_at_line) in env_tint_open.drain() {
+        issues.push(LifecycleIssue {
+            auto_fix: Some(format!("env_tint(\"{obj}\", [1,1,1,1], 0)")),
+            object: obj,
+            call_kind: LifecycleCallKind::EnvTint,
+            opened_at_line,
+            boundary_line: line,
+            boundary_kind: kind,
+        });
+    }
+    for ((obj, layer), opened_at_line) in vfx_open.drain() {
+        let auto_fix = if obj == "cam" {
+            Some(format!("vfx(\"{obj}\", [null, {layer}])"))
+        } else {
+            Some(format!("vfx(\"{obj}\", null)"))
+        };
+        issues.push(LifecycleIssue {
+            object: vfx_object_label(&obj, layer),
+            call_kind: LifecycleCallKind::Vfx,
+            opened_at_line,
+            boundary_line: line,
+            boundary_kind: kind,
+            auto_fix,
+        });
+    }
+    for (channel, opened_at_line) in audio_open.drain() {
+        issues.push(LifecycleIssue {
+            auto_fix: Some(format!("stop(\"{channel}\", 0)")),
+            object: channel,
+            call_kind: LifecycleCallKind::Audio,
+            opened_at_line,
+            boundary_line: line,
+            boundary_kind: kind,
+        });
+    }
+    for (obj, opened_at_line) in show_open {
+        issues.push(LifecycleIssue {
+            object: obj.clone(),
+            call_kind: LifecycleCallKind::Show,
+            opened_at_line: *opened_at_line,
+            boundary_line: line,
+            boundary_kind: kind,
+            auto_fix: None,
+        });
+    }
+}
+
+/// Walks the script top-to-bottom tracking what visual/audio state is "open" (shown, non-default
+/// tint, an active vfx layer, a playing audio channel), and flags anything still open at a scene
+/// boundary or EOF. Scene boundaries reuse rule 11's exact definition: a `trans*` call, or a
+/// repeated `show("bg"|"fg", different_path)` with no intervening `hide`. Same-layer `vfx`
+/// overwrites and `"cam"`'s 4 independent layers are handled per novascript-reference.md's VFX
+/// layer section, not flagged as leaks. `move` is intentionally not tracked - it has no binary
+/// open/close state, only content-dependent "the right value", and isn't a leak in the same sense.
+pub(crate) fn check_lifecycle_issues(script: &str) -> Vec<LifecycleIssue> {
+    let events = collect_lifecycle_events(script);
+
+    let mut tint_open: HashMap<String, u32> = HashMap::new();
+    let mut env_tint_open: HashMap<String, u32> = HashMap::new();
+    let mut vfx_open: HashMap<(String, u32), u32> = HashMap::new();
+    let mut audio_open: HashMap<String, u32> = HashMap::new();
+    let mut show_open: HashMap<String, u32> = HashMap::new();
+    let mut last_bg_fg_path: HashMap<String, String> = HashMap::new();
+    let mut issues: Vec<LifecycleIssue> = Vec::new();
+    let mut in_sequence = false;
+
+    for (offset, event) in events {
+        let line = byte_offset_to_line(script, offset);
+        match event {
+            LifecycleEvent::SequenceBoundary { is_start: true } => {
+                in_sequence = true;
+            }
+            LifecycleEvent::SequenceBoundary { is_start: false } => {
+                flush_lifecycle_boundary(line, "sequence_end", &mut tint_open, &mut env_tint_open, &mut vfx_open, &mut audio_open, &show_open, &mut issues);
+                in_sequence = false;
+            }
+            LifecycleEvent::Boundary { kind } => {
+                if !in_sequence {
+                    flush_lifecycle_boundary(line, kind, &mut tint_open, &mut env_tint_open, &mut vfx_open, &mut audio_open, &show_open, &mut issues);
+                }
+            }
+            LifecycleEvent::Show { obj, is_bg_or_fg, path } => {
+                if is_bg_or_fg {
+                    let switched = last_bg_fg_path.get(&obj).is_some_and(|prev| Some(prev.as_str()) != path.as_deref());
+                    if switched && !in_sequence {
+                        flush_lifecycle_boundary(line, "show_switch", &mut tint_open, &mut env_tint_open, &mut vfx_open, &mut audio_open, &show_open, &mut issues);
+                    }
+                    // Tracking continues even while suppressed inside a sequence - otherwise the
+                    // first real switch right after the sequence ends would misjudge whether it's
+                    // actually different from whatever was showing before the sequence began.
+                    if let Some(path) = path {
+                        last_bg_fg_path.insert(obj, path);
+                    }
+                } else {
+                    show_open.entry(obj).or_insert(line);
+                }
+            }
+            LifecycleEvent::Hide { obj } => {
+                show_open.remove(&obj);
+                last_bg_fg_path.remove(&obj);
+            }
+            LifecycleEvent::Tint { obj, is_default } => {
+                if is_default {
+                    tint_open.remove(&obj);
+                } else {
+                    tint_open.entry(obj).or_insert(line);
+                }
+            }
+            LifecycleEvent::EnvTint { obj, is_default } => {
+                if is_default {
+                    env_tint_open.remove(&obj);
+                } else {
+                    env_tint_open.entry(obj).or_insert(line);
+                }
+            }
+            LifecycleEvent::Vfx { obj, layer, is_clear } => {
+                let key = (obj, layer);
+                if is_clear {
+                    vfx_open.remove(&key);
+                } else {
+                    vfx_open.insert(key, line);
+                }
+            }
+            LifecycleEvent::AudioOpen { channel } => {
+                audio_open.entry(channel).or_insert(line);
+            }
+            LifecycleEvent::AudioClose { channel } => {
+                audio_open.remove(&channel);
+            }
+        }
+    }
+
+    // One past the last line, so an EOF auto-fix appends after the final line rather than
+    // displacing it (see apply_lifecycle_autofixes's insert-before-boundary-line convention).
+    let final_line = script.lines().count() as u32 + 1;
+    flush_lifecycle_boundary(final_line, "eof", &mut tint_open, &mut env_tint_open, &mut vfx_open, &mut audio_open, &show_open, &mut issues);
+
+    issues
+}
+
+/// Splits `check_lifecycle_issues` findings into mechanical fixes (tint/env_tint/vfx/audio - one
+/// unambiguous closed value, applied directly with no model round trip) and judgment calls (show -
+/// returned for the caller to feed back to the model). Auto-fixes are inserted as new lines
+/// immediately before their boundary line, processed bottom-to-top so earlier insertions don't
+/// shift the line numbers later ones still need.
+pub fn apply_lifecycle_autofixes(script: &str) -> (String, Vec<LifecycleIssue>) {
+    let issues = check_lifecycle_issues(script);
+    let mut auto_fixable: Vec<&LifecycleIssue> = issues.iter().filter(|issue| issue.auto_fix.is_some()).collect();
+    auto_fixable.sort_by_key(|issue| std::cmp::Reverse(issue.boundary_line));
+
+    let mut lines: Vec<String> = script.lines().map(str::to_string).collect();
+    for issue in auto_fixable {
+        let Some(fix_line) = &issue.auto_fix else { continue };
+        let insert_at = (issue.boundary_line.saturating_sub(1) as usize).min(lines.len());
+        lines.insert(insert_at, fix_line.clone());
+    }
+
+    let remaining: Vec<LifecycleIssue> = issues.into_iter().filter(|issue| issue.auto_fix.is_none()).collect();
+    (lines.join("\n"), remaining)
+}
+
+/// Formats the judgment-only (non-auto-fixable, i.e. `Show`) issues `apply_lifecycle_autofixes`
+/// returns into a single message for `build_retry_prompt`, matching the other `format_*_issues`
+/// functions' tone: explain what was found, point at the exact lines, suggest the fix without
+/// applying it - "should this object still be on screen" is a content call, not code's to make.
+pub fn format_lifecycle_issues(issues: &[LifecycleIssue]) -> String {
+    let details: Vec<String> = issues
+        .iter()
+        .map(|issue| {
+            format!(
+                "第{}行对 \"{}\" 调用了 show，但第{}行的场景切换（{}）之前没有 hide，请确认该对象是否应该在新场景里继续显示——需要的话补一条 hide(\"{}\")，如果确实要保留，也请在脚本里体现出这是有意保留的",
+                issue.opened_at_line, issue.object, issue.boundary_line, issue.boundary_kind, issue.object
+            )
+        })
+        .collect();
+    format!("脚本中存在跨场景未关闭的显示状态：{}", details.join("；"))
+}
+
+/// A `# vvn:seq begin` marker with no matching `# vvn:seq end` before EOF. This both means the
+/// rest of the file silently loses scene-boundary cleanup checking (since `check_lifecycle_issues`
+/// stays in suppressed mode once `in_sequence` is set and only the end marker clears it) and
+/// usually signals a simple authoring mistake - the performance-sequence span was never closed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnclosedSequenceIssue {
+    pub opened_at_line: u32,
+}
+
+/// Pairs up begin/end sequence markers in document order (a plain stack: push on begin, pop on
+/// end) and reports any begin left on the stack at EOF. Operates on the final generated script
+/// text, independent of how many `#seq:` spans the original dialogue-only input declared.
+pub(crate) fn check_unclosed_sequences(script: &str) -> Vec<UnclosedSequenceIssue> {
+    let mut markers: Vec<(usize, bool)> = Vec::new();
+    for offset in find_marker_lines(script, world_state::SEQUENCE_BEGIN_MARKER) {
+        markers.push((offset, true));
+    }
+    for offset in find_marker_lines(script, world_state::SEQUENCE_END_MARKER) {
+        markers.push((offset, false));
+    }
+    markers.sort_by_key(|(offset, _)| *offset);
+
+    let mut open_stack: Vec<u32> = Vec::new();
+    for (offset, is_start) in markers {
+        let line = byte_offset_to_line(script, offset);
+        if is_start {
+            open_stack.push(line);
+        } else {
+            open_stack.pop();
+        }
+    }
+
+    open_stack.into_iter().map(|opened_at_line| UnclosedSequenceIssue { opened_at_line }).collect()
+}
+
+pub fn format_unclosed_sequence_issues(issues: &[UnclosedSequenceIssue]) -> String {
+    let details: Vec<String> = issues
+        .iter()
+        .map(|issue| format!("第{}行开始的演出序列（# vvn:seq begin）没有对应的 # vvn:seq end，请补上收尾标记", issue.opened_at_line))
+        .collect();
+    format!("脚本中存在未闭合的演出序列：{}", details.join("；"))
+}
+
+const TERMINAL_CALL_KINDS: [&str; 4] = ["label", "is_end", "jump_to", "branch"];
+
+/// Whether the script's last node was ever explicitly closed - see novascript-reference.md §1.3's
+/// hard constraint: only the *next* eager block (the next `label()`, or
+/// `is_end()`/`jump_to()`/`branch()`) flushes a node's trailing dialogue into a `DialogueEntry`.
+/// The engine's end-of-file auto `is_end()` insertion only resets node-type bookkeeping, not this
+/// flush, so a last node with no explicit closer silently loses its trailing dialogue.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TerminalClosureIssue {
+    pub node_label: Option<String>,
+    pub label_line: u32,
+    pub last_content_line: u32,
+}
+
+fn last_non_blank_line(script: &str) -> u32 {
+    let lines: Vec<&str> = script.lines().collect();
+    lines
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, line)| !line.trim().is_empty())
+        .map(|(index, _)| index as u32 + 1)
+        .unwrap_or(1)
+}
+
+/// Only the very last of `label`/`is_end`/`jump_to`/`branch` (by position) matters: an earlier
+/// node missing an explicit closer is fine, since the *next* node's `label()` call is itself the
+/// eager block that flushes its predecessor's trailing dialogue - see §1.3's exact wording. A
+/// script with none of these four calls at all is a single implicit node that still needs an
+/// explicit closer.
+pub(crate) fn check_terminal_closure(script: &str) -> Vec<TerminalClosureIssue> {
+    let mut occurrences: Vec<(usize, &str)> = Vec::new();
+    for call_name in TERMINAL_CALL_KINDS {
+        for call_start in find_call_starts(script, call_name) {
+            occurrences.push((call_start, call_name));
+        }
+    }
+    occurrences.sort_by_key(|(offset, _)| *offset);
+
+    let last_content_line = last_non_blank_line(script);
+    match occurrences.last() {
+        None => vec![TerminalClosureIssue { node_label: None, label_line: 1, last_content_line }],
+        Some((offset, kind)) if *kind == "label" => {
+            let node_label = extract_quoted_arg(&script[*offset..]).map(|(name, _)| name.to_string());
+            vec![TerminalClosureIssue { node_label, label_line: byte_offset_to_line(script, *offset), last_content_line }]
+        }
+        Some(_) => Vec::new(),
+    }
+}
+
+/// Matches the other `format_*_issues` functions' tone: explain the failure mode in plain
+/// language and suggest the exact fix (per the prompt's request, an `@<| is_end() |>` line) rather
+/// than silently inserting it - unlike the lifecycle tracker's mechanical fixes, closure structure
+/// is cheap enough for the model to get right once told exactly where it's missing.
+pub fn format_terminal_closure_issues(issues: &[TerminalClosureIssue]) -> String {
+    issues
+        .iter()
+        .map(|issue| {
+            let label_desc = issue.node_label.as_ref().map(|name| format!("（\"{name}\"）")).unwrap_or_default();
+            format!(
+                "脚本最后一个节点{label_desc}在文件末尾之前没有用 is_end()/jump_to()/branch() 收尾——根据 NovaScript 解析规则，最后一段对话/lazy 块会被静默丢弃，该节点的对话数会变成 0。请在第{}行之后补一行 @<| is_end() |>（如果这是一个有名字的结局，用 @<| is_end(\"结局名\") |>；如果应该跳转或分支，改用对应的 jump_to()/branch() 收尾）。",
+                issue.last_content_line
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("；")
+}
+
 pub fn build_generation_prompt(
     nova2_project_dir: &Path,
     vfx_notes_path: &str,
@@ -478,6 +989,177 @@ pub fn build_generation_prompt(
     ));
 
     sections.push(format!("## 用户需求\n\n{user_prompt}"));
+    Ok(sections.join("\n\n"))
+}
+
+/// Per node: groups consecutive moments sharing the same `background` into one descriptive line
+/// each (the natural generalization of the old one-line-per-scene format, computed post-hoc from
+/// each moment's sticky `#loc:` annotation rather than relying on any pre-grouped scene list,
+/// since `#loc:` no longer drives node structure - see Correction 1), flags `RawPassthrough` spans
+/// so the model knows not to touch them, and surfaces `Branch`/`Jump` terminators' destinations
+/// (and, for `Branch`, each option's text/mode/cond) so the model understands the node's exit
+/// point exists without being allowed to modify it.
+fn format_world_state_timeline(timeline: &world_state::WorldStateTimeline) -> String {
+    let mut lines = Vec::new();
+    if !timeline.distinct_speakers.is_empty() {
+        lines.push(format!("- 本次对话涉及的说话人（显示名，按首次出现顺序）：{}", timeline.distinct_speakers.join("、")));
+    }
+
+    for node in &timeline.nodes {
+        let node_label = node.name.as_deref().unwrap_or("主节点");
+        lines.push(format!("- 节点 \"{node_label}\"："));
+
+        let mut index = 0;
+        let mut beat_number = 0;
+        while index < node.items.len() {
+            match &node.items[index] {
+                world_state::NodeItem::RawPassthrough(_) => {
+                    lines.push("  - （这里有一段作者手写的演出内容，已原样保留在骨架中，不需要你处理）".to_string());
+                    index += 1;
+                }
+                world_state::NodeItem::Moment(first) => {
+                    let background = first.background.as_deref();
+                    let mut group_end = index + 1;
+                    while group_end < node.items.len() {
+                        match &node.items[group_end] {
+                            world_state::NodeItem::Moment(moment) if moment.background.as_deref() == background => group_end += 1,
+                            _ => break,
+                        }
+                    }
+                    beat_number += 1;
+                    let on_stage = node.items[index..group_end]
+                        .iter()
+                        .filter_map(|item| match item {
+                            world_state::NodeItem::Moment(moment) => Some(moment),
+                            world_state::NodeItem::RawPassthrough(_) => None,
+                        })
+                        .last()
+                        .map(|moment| moment.on_stage.join("、"))
+                        .unwrap_or_default();
+                    let background_desc = background.unwrap_or("（未标注背景，沿用之前的画面，或视为不需要切换背景）");
+                    lines.push(format!(
+                        "  - 第 {beat_number} 段：背景 {background_desc}；在场角色（按出现顺序）：{}",
+                        if on_stage.is_empty() { "（无对话角色，可能是纯旁白）".to_string() } else { on_stage }
+                    ));
+                    index = group_end;
+                }
+            }
+        }
+
+        match &node.terminator {
+            world_state::NodeTerminator::End => {}
+            world_state::NodeTerminator::Jump(dest) => {
+                lines.push(format!("  - 本节点结束后跳转到节点 \"{dest}\"（骨架里已经写好 jump_to，不能改动）"));
+            }
+            world_state::NodeTerminator::Branch(options) => {
+                let option_descs: Vec<String> = options
+                    .iter()
+                    .map(|option| {
+                        let mut parts = vec![format!("跳转到 \"{}\"", option.dest)];
+                        if let Some(text) = &option.text {
+                            parts.push(format!("文案「{text}」"));
+                        }
+                        if let Some(mode) = &option.mode {
+                            parts.push(format!("mode={mode}"));
+                        }
+                        if let Some(cond) = &option.cond {
+                            parts.push(format!("cond={cond}"));
+                        }
+                        parts.join("，")
+                    })
+                    .collect();
+                lines.push(format!("  - 本节点以分支结束（骨架里已经写好 branch，不能改动），选项：{}", option_descs.join("；")));
+            }
+        }
+    }
+
+    lines.join("\n")
+}
+
+/// AUTOSTAGE's prompt builder - deliberately separate from `build_generation_prompt` rather than
+/// sharing it, since the two modes' rule sets actively conflict (edit mode forbids touching
+/// existing content/dialogue by default; AUTOSTAGE's whole job is generating new content and
+/// dialogue is given, not editable). Reuses the same known-resource list helpers and the full
+/// reference doc; the model's freedom is bounded by the world-state timeline and the pre-built
+/// node skeleton rather than by "don't touch existing content" rules, since there is no existing
+/// content here. Rule 11 (persistent-effect reversion before scene boundaries) from
+/// `build_generation_prompt` is deliberately NOT repeated here as a prose instruction - it's
+/// exactly the rule that's proven not to work, and AUTOSTAGE leans on the lifecycle tracker
+/// (`check_lifecycle_issues`/`apply_lifecycle_autofixes`) as the real enforcement instead.
+pub fn build_autostage_prompt(
+    nova2_project_dir: &Path,
+    vfx_notes_path: &str,
+    target_file: &str,
+    timeline: &world_state::WorldStateTimeline,
+    skeleton: &str,
+) -> Result<String, BackendError> {
+    let reference_path = nova2_project_dir.join("novascript-reference.md");
+    let reference_text = fs::read_to_string(&reference_path).map_err(|error| {
+        BackendError::message(format!("读取 {} 失败: {error}", reference_path.display()))
+    })?;
+
+    let mut sections = vec![
+        "你现在要为 Nova2 把一份纯对话剧本（已经搭好结构骨架，台词逐字保留）补全成完整可播放的 NovaScript 演出剧本。严格遵守下面提供的参考文档与约束；在动笔前必须把下方的 NovaScript 参考文档、已知资源清单、世界状态时间线与“节点骨架”当作唯一工程事实来使用，不得凭记忆假设 API、资源、角色或演出规则。输出必须满足以下规则：\n\
+        1. 默认只输出脚本文本本身，不要输出解释、标题、Markdown 代码块或围栏。\n\
+        2. 如果台词涉及的说话人不在“已知角色绑定名”列表里，允许在第一行单独输出一行 `#NEWCHARS: [{\"node\":\"...\",\"bind\":\"...\",\"folder\":\"...\"}]`，除此之外不要输出任何额外元信息。\n\
+        3. `#NEWCHARS:` 如果出现，必须是整个回复的第一行，后面紧跟合法 JSON 数组。\n\
+        4. `#NEWCHARS:` 之后从第二行开始输出完整脚本文本。\n\
+        5. 最终脚本必须能被引擎直接重载解析。\n\
+        6. 下面“节点骨架”一节已经搭好了 label/jump_to/is_end/branch 等结构性 eager 调用和节点划分，必须逐字保留——只能在每个 `<| ... |>` 占位块内部把里面的占位注释替换/扩展成真正的演出函数调用，不能修改、删除、移动骨架里的结构性调用或节点划分本身，也不能新增/删除节点。如果某个占位块里除了 TODO 注释外还有一行“演出要求：...”的注释，这是用户写在剧本里、必须满足的具体技术要求（例如指定音乐、动画），必须把它落实成对应的函数调用，不能忽略、不能只当成参考建议自由发挥；占位块里没有这行注释的，才完全由你自行决定演出内容。如果某个占位块的位置被替换成了 `# vvn:seq begin` / `# vvn:seq end` 包裹的内容，这是作者自己手写好的完整演出代码（不是占位符），必须原样保留，一个字符都不能改动，也不能在这两行之间补充、删除或调整任何内容——这部分内容已经是“成品”，不需要你处理，也不允许你处理。\n\
+        7. 骨架里每个占位块后面紧跟的一行台词文本必须逐字保留，不能改写、增删、合并或调整顺序——这次任务只是在台词前后补演出，不是改台词。\n\
+        8. 只能对“世界状态时间线”里标注为在场的角色对象进行 show/tint/move 等操作；不要凭空引入时间线之外、本次没有登场的角色。背景切换的时机由世界状态时间线里每一拍标注的背景决定——你只负责把对应的 show 调用放在正确的占位块里，不需要、也不能自行决定要不要切换背景、要不要拆分节点；节点划分（label/jump_to/branch 的结构和数量）已经由骨架确定，不是你这一步要考虑的事。\n\
+        9. 只能引用真实存在的资源路径：“已知背景/立绘资源路径”列表之外、看起来像是合理猜测但实际不存在的路径（例如把 `backgrounds/room` 简写成 `room`）禁止使用；非角色对象（如 `\"bg\"`/`\"fg\"`）的 `show`/`trans*` 图片路径必须原样取自该列表，世界状态时间线里标注的背景路径也必须原样使用。\n\
+        10. 同理，`play`/`fade_in` 的曲目名必须原样取自“已知音轨”列表里对应 channel 下的曲目；`sound()` 的音效名必须原样取自“已知音效”列表；`vfx()` 的 shader 名必须原样取自“已知 VFX shader”列表。这几类资源都不允许凭语感/常见叫法臆造。如果列表里确实没有合适的现成资源，宁可放弃这个细节或换一种已有资源能实现的方案，也不要编一个不存在的名字。\n\
+        11. `entry` 参数是 NovaScript 唯一的“排队/排序”机制：同一个 `<| ... |>` block 里的语句是 GDScript 立即顺序执行的，并不会真的等待——`wait(duration)`/`vfx(...)`/`move(...)` 等返回的是一个可以继续往后链的“链尾”，但只有当你把这个返回值显式接住并传给下一步调用的 `entry` 参数时，下一步才会真的排在“等待结束之后”；如果某一步调用的 `wait(...)` 返回值没有被接住传下去，后面那些仍然用默认 `entry`（`o.anim` 根）的调用会和前面的调用同时触发，而不是按你写的先后顺序播放，等于前面的 `wait` 完全没有效果。需要在同一个 block 内对同一个 obj/层先做 A、停顿、再做 B 时，必须像这样显式链接：`var e = vfx(\"cam\", \"glitch\", 0.9, 0.05)\ne = wait(0.05, e)\ne = vfx(\"cam\", \"glitch\", 0, 0.06, null, e)`。另外，`vfx(\"cam\", shader_layer, ...)` 在不指定 `layer_id` 时默认都落在 layer 0：需要同时叠加多个画面特效时要显式分配不同的 layer_id（0~3）。\n\
+        12. 通过 `move`/`show` 的 `coord`（`[x, y, scale, z, angle]`）改变立绘对象的 `scale` 时要格外谨慎：默认应以已知内容里最近一次同类调用设定的 `(x, y, scale)` 作为基准，只做小幅调整（建议相对原 `scale` 的变化幅度控制在 30%~40% 以内），除非确有必要大幅推近镜头。\n\
+        13. `tint`/`env_tint` 绝对不能把 `\"cam\"` 当作 `obj` 使用：`\"cam\"` 绑定的是 `Camera3D`，没有 `modulate` 属性——`tint(\"cam\", ...)` 在引擎里会直接抛异常崩掉那个 tween。`tint`/`env_tint` 只能用在 `\"bg\"`/`\"fg\"`/角色立绘对象上；需要给整个镜头叠加颜色时改用 `vfx(\"cam\", [\"color\", layer_id], t, duration, { \"_ColorMul\": ... })`。\n\
+        14. `tint`/`env_tint`/`vfx`/`play` 等持久化效果跨场景边界的收尾，不需要你刻意操心——这部分已经由确定性代码事后扫描并自动修复或单独提示，你只需要专注于这一拍该有的演出本身，不必为了“怕泄漏”而在每个场景末尾画蛇添足地补一堆还原调用。".to_string(),
+        format!("## NovaScript 参考文档\n\n{reference_text}"),
+    ];
+
+    let known_characters = list_known_character_bind_names(nova2_project_dir);
+    if !known_characters.is_empty() {
+        sections.push(format!("## 已知角色绑定名\n\n{}", known_characters.join(", ")));
+    }
+
+    let known_asset_paths = list_known_asset_script_paths(nova2_project_dir);
+    if !known_asset_paths.is_empty() {
+        sections.push(format!("## 已知背景/立绘资源路径\n\n{}", known_asset_paths.join(", ")));
+    }
+
+    let audio_layout = list_known_audio_layout(nova2_project_dir);
+    if !audio_layout.channel_tracks.is_empty() {
+        let lines: Vec<String> = audio_layout
+            .channel_tracks
+            .iter()
+            .map(|(channel, tracks)| format!("- {channel}: {}", tracks.join(", ")))
+            .collect();
+        sections.push(format!("## 已知音轨（play/fade_in 的 channel: 曲目列表）\n\n{}", lines.join("\n")));
+    }
+    if !audio_layout.one_shot_tracks.is_empty() {
+        sections.push(format!("## 已知音效（sound() 可用文件名）\n\n{}", audio_layout.one_shot_tracks.join(", ")));
+    }
+
+    let known_shaders = list_known_shader_names(nova2_project_dir);
+    if !known_shaders.is_empty() {
+        sections.push(format!("## 已知 VFX shader（vfx() 可用名字）\n\n{}", known_shaders.join(", ")));
+    }
+
+    let vfx_notes_path = vfx_notes_path.trim();
+    if !vfx_notes_path.is_empty() {
+        let path = Path::new(vfx_notes_path);
+        if path.exists() {
+            let vfx_notes = fs::read_to_string(path)
+                .map_err(|error| BackendError::message(format!("读取 {} 失败: {error}", path.display())))?;
+            sections.push(format!("## 动画/VFX 说明\n\n{vfx_notes}"));
+        }
+    }
+
+    sections.push(format!("## 世界状态时间线\n\n{}", format_world_state_timeline(timeline)));
+    sections.push(format!(
+        "## 目标文件 {target_file} 的节点骨架（必须逐字保留结构和台词，只能在每个 `<| ... |>` 占位块内部把占位注释替换成真正的演出调用）\n\n{skeleton}"
+    ));
+
     Ok(sections.join("\n\n"))
 }
 
@@ -732,6 +1414,100 @@ mod tests {
         let prompt = build_generation_prompt(&dir, "", "ch1.txt", "ergong::你好\n", "加一句台词", Some(&plan)).unwrap();
 
         assert!(!prompt.contains("本次演出策划"));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn autostage_prompt_surfaces_hint_requirement_and_instructs_model_to_honor_it() {
+        let dir = make_fixture_project(None);
+        let dialogue = "#hnt: 配雨声环境音\nergong::外面下雨了呢\n";
+        let timeline = world_state::derive_world_state_timeline(dialogue, "ch1_autostage").unwrap();
+        let skeleton = world_state::build_node_skeleton(&timeline, "ch1_autostage");
+        let prompt = build_autostage_prompt(&dir, "", "ch1.txt", &timeline, &skeleton).unwrap();
+
+        assert!(prompt.contains("演出要求"));
+        assert!(prompt.contains("配雨声环境音"));
+        assert!(prompt.contains("必须把它落实成对应的函数调用"));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn autostage_prompt_includes_skeleton_and_world_state_timeline() {
+        let dir = make_fixture_project(None);
+        let dialogue = "#loc: backgrounds/room\nergong::你好\n张浅野::早上好\n";
+        let timeline = world_state::derive_world_state_timeline(dialogue, "ch1_autostage").unwrap();
+        let skeleton = world_state::build_node_skeleton(&timeline, "ch1_autostage");
+        let prompt = build_autostage_prompt(&dir, "", "ch1.txt", &timeline, &skeleton).unwrap();
+
+        assert!(prompt.contains("世界状态时间线"));
+        assert!(prompt.contains("ergong"));
+        assert!(prompt.contains("张浅野"));
+        assert!(prompt.contains("backgrounds/room"));
+        assert!(prompt.contains("label(\"ch1_autostage\""));
+        assert!(prompt.contains("is_end()"));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn autostage_prompt_omits_edit_mode_preserve_unchanged_rule() {
+        let dir = make_fixture_project(None);
+        let dialogue = "ergong::你好\n";
+        let timeline = world_state::derive_world_state_timeline(dialogue, "ch1_autostage").unwrap();
+        let skeleton = world_state::build_node_skeleton(&timeline, "ch1_autostage");
+        let prompt = build_autostage_prompt(&dir, "", "ch1.txt", &timeline, &skeleton).unwrap();
+
+        // Rule 6 in build_generation_prompt is specific to editing existing content; AUTOSTAGE
+        // generates fresh staging around given dialogue, so that wording must not leak in here.
+        assert!(!prompt.contains("只修改用户需求里明确要求的那部分"));
+        // The dialogue-preservation rule still applies, just phrased for AUTOSTAGE's own task.
+        assert!(prompt.contains("台词文本必须逐字保留"));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn skeleton_alone_passes_terminal_closure_and_lifecycle_checks() {
+        // The skeleton has no show/tint/vfx/play calls yet (the model fills those in), and always
+        // ends with is_end() by construction - so it must satisfy Phase 1/2's validators with zero
+        // issues even before any staging is added. This is what lets AUTOSTAGE skip the model
+        // remembering closure/lifecycle rules entirely for the structural parts.
+        let dialogue = "#loc: backgrounds/room\nergong::你好\n张浅野::早上好\n\n#loc: backgrounds/corridor\nergong::走吧\n";
+        let timeline = world_state::derive_world_state_timeline(dialogue, "ch1_autostage").unwrap();
+        let skeleton = world_state::build_node_skeleton(&timeline, "ch1_autostage");
+
+        assert!(check_terminal_closure(&skeleton).is_empty());
+        assert!(check_lifecycle_issues(&skeleton).is_empty());
+    }
+
+    #[test]
+    fn autostage_prompt_includes_known_character_and_asset_lists() {
+        let dir = make_fixture_project(None);
+        write_background_fixture(&dir, "room");
+        let dialogue = "ergong::你好\n";
+        let timeline = world_state::derive_world_state_timeline(dialogue, "ch1_autostage").unwrap();
+        let skeleton = world_state::build_node_skeleton(&timeline, "ch1_autostage");
+        let prompt = build_autostage_prompt(&dir, "", "ch1.txt", &timeline, &skeleton).unwrap();
+
+        assert!(prompt.contains("已知角色绑定名"));
+        assert!(prompt.contains("已知背景/立绘资源路径"));
+        assert!(prompt.contains("backgrounds/room"));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn autostage_prompt_includes_amended_skeleton_preservation_rule_mentioning_seq_markers() {
+        let dir = make_fixture_project(None);
+        let dialogue = "ergong::你好\n";
+        let timeline = world_state::derive_world_state_timeline(dialogue, "ch1_autostage").unwrap();
+        let skeleton = world_state::build_node_skeleton(&timeline, "ch1_autostage");
+        let prompt = build_autostage_prompt(&dir, "", "ch1.txt", &timeline, &skeleton).unwrap();
+
+        assert!(prompt.contains("vvn:seq begin"));
+        assert!(prompt.contains("作者自己手写好的完整演出代码"));
 
         fs::remove_dir_all(&dir).ok();
     }
@@ -1007,5 +1783,316 @@ mod tests {
         println!("=== prompt sent ===\n{prompt}\n=== end prompt ===");
         let output = generate_with_prompt(&prompt, &deepseek_key, llm::DEEPSEEK_MODEL_FLASH).await.unwrap();
         println!("=== model output ===\n{output}\n=== end ===");
+    }
+
+    #[test]
+    fn accepts_show_then_hide_before_boundary() {
+        let script = "show(\"yuki\", \"normal\")\nhide(\"yuki\")\ntrans_fade(\"cam\", \"backgrounds/toilet\", 2)\n";
+        let issues = check_lifecycle_issues(script);
+        assert!(issues.iter().all(|issue| issue.object != "yuki"));
+    }
+
+    #[test]
+    fn flags_show_left_open_across_trans_boundary() {
+        let script = "show(\"yuki\", \"normal\")\ntrans_fade(\"cam\", \"backgrounds/toilet\", 2)\n";
+        let issues = check_lifecycle_issues(script);
+        // "yuki" is never hidden, so it's re-flagged at every boundary it's still open at - here
+        // both the trans_fade boundary and the implicit EOF boundary right after it.
+        let show_issues: Vec<_> = issues.iter().filter(|issue| issue.call_kind == LifecycleCallKind::Show).collect();
+        assert_eq!(show_issues.len(), 2);
+        let trans_issue = show_issues.iter().find(|issue| issue.boundary_kind == "trans_fade").unwrap();
+        assert_eq!(trans_issue.object, "yuki");
+        assert_eq!(trans_issue.opened_at_line, 1);
+        assert_eq!(trans_issue.boundary_line, 2);
+        assert!(trans_issue.auto_fix.is_none());
+    }
+
+    #[test]
+    fn accepts_tint_reverted_to_default_before_boundary() {
+        let script = "tint(\"bg\", [0.55,0.6,0.68], 0)\ntint(\"bg\", [1,1,1,1], 0)\ntrans_fade(\"cam\", \"backgrounds/toilet\", 2)\n";
+        let issues = check_lifecycle_issues(script);
+        assert!(issues.iter().all(|issue| issue.call_kind != LifecycleCallKind::Tint));
+    }
+
+    #[test]
+    fn auto_fixes_tint_left_open_before_boundary() {
+        let script = "tint(\"bg\", [0.55,0.6,0.68], 0)\ntrans_fade(\"cam\", \"backgrounds/toilet\", 2)\n";
+        let (patched, remaining) = apply_lifecycle_autofixes(script);
+        assert!(remaining.is_empty());
+        let lines: Vec<&str> = patched.lines().collect();
+        let trans_index = lines.iter().position(|line| line.starts_with("trans_fade")).unwrap();
+        assert_eq!(lines[trans_index - 1], "tint(\"bg\", [1,1,1,1], 0)");
+    }
+
+    #[test]
+    fn accepts_play_stopped_before_boundary() {
+        let script = "play(\"bgm\", \"prelude\", 0.5)\nstop(\"bgm\", 0)\ntrans_fade(\"cam\", \"backgrounds/toilet\", 2)\n";
+        let issues = check_lifecycle_issues(script);
+        assert!(issues.iter().all(|issue| issue.call_kind != LifecycleCallKind::Audio));
+    }
+
+    #[test]
+    fn auto_fixes_play_left_running_across_boundary() {
+        let script = "play(\"bgm\", \"prelude\", 0.5)\ntrans_fade(\"cam\", \"backgrounds/toilet\", 2)\n";
+        let (patched, remaining) = apply_lifecycle_autofixes(script);
+        assert!(remaining.is_empty());
+        let lines: Vec<&str> = patched.lines().collect();
+        let trans_index = lines.iter().position(|line| line.starts_with("trans_fade")).unwrap();
+        assert_eq!(lines[trans_index - 1], "stop(\"bgm\", 0)");
+    }
+
+    #[test]
+    fn auto_fix_at_eof_appends_after_last_line_instead_of_replacing_it() {
+        let script = "show(\"yuki\", \"normal\")\nplay(\"bgm\", \"prelude\", 0.5)\n";
+        let (patched, _remaining) = apply_lifecycle_autofixes(script);
+        let lines: Vec<&str> = patched.lines().collect();
+        assert_eq!(lines[0], "show(\"yuki\", \"normal\")");
+        assert_eq!(lines[1], "play(\"bgm\", \"prelude\", 0.5)");
+        assert_eq!(lines.last().copied(), Some("stop(\"bgm\", 0)"));
+    }
+
+    #[test]
+    fn does_not_flag_vfx_same_layer_overwrite_as_leak() {
+        let script = "vfx(\"cam\", \"glitch\", 0.9, 0.05)\nvfx(\"cam\", \"shake\", 0.5, 0.1)\n";
+        let issues = check_lifecycle_issues(script);
+        let vfx_issues: Vec<_> = issues.iter().filter(|issue| issue.call_kind == LifecycleCallKind::Vfx).collect();
+        assert_eq!(vfx_issues.len(), 1);
+        assert_eq!(vfx_issues[0].object, "cam:0");
+    }
+
+    #[test]
+    fn tracks_cam_vfx_layers_independently() {
+        let script = "vfx(\"cam\", [\"color\", 0], 1, 0.5)\nvfx(\"cam\", [\"rain\", 1], 1, 0.5)\nvfx(\"cam\", [null, 1], 0, 0)\ntrans_fade(\"cam\", \"backgrounds/toilet\", 2)\n";
+        let issues = check_lifecycle_issues(script);
+        let vfx_issues: Vec<_> = issues.iter().filter(|issue| issue.call_kind == LifecycleCallKind::Vfx).collect();
+        assert_eq!(vfx_issues.len(), 1);
+        assert_eq!(vfx_issues[0].object, "cam:0");
+    }
+
+    #[test]
+    fn entry_chaining_does_not_confuse_vfx_parsing() {
+        let script = "var e = vfx(\"cam\", \"glitch\", 0.9, 0.05)\ne = wait(0.05, e)\ne = vfx(\"cam\", \"glitch\", 0, 0.06, null, e)\n";
+        let issues = check_lifecycle_issues(script);
+        let vfx_issues: Vec<_> = issues.iter().filter(|issue| issue.call_kind == LifecycleCallKind::Vfx).collect();
+        assert_eq!(vfx_issues.len(), 1);
+        assert_eq!(vfx_issues[0].object, "cam:0");
+        assert_eq!(vfx_issues[0].boundary_kind, "eof");
+    }
+
+    #[test]
+    fn repeated_show_bg_different_path_without_hide_is_a_boundary() {
+        let script = "tint(\"yuki\", [0.3,0.3,0.3], 0)\nshow(\"bg\", \"backgrounds/room\")\nshow(\"bg\", \"backgrounds/toilet\")\n";
+        let issues = check_lifecycle_issues(script);
+        let tint_issues: Vec<_> = issues.iter().filter(|issue| issue.call_kind == LifecycleCallKind::Tint).collect();
+        assert_eq!(tint_issues.len(), 1);
+        assert_eq!(tint_issues[0].boundary_kind, "show_switch");
+    }
+
+    #[test]
+    fn repeated_show_bg_same_path_is_not_a_boundary() {
+        let script = "tint(\"yuki\", [0.3,0.3,0.3], 0)\nshow(\"bg\", \"backgrounds/room\")\nshow(\"bg\", \"backgrounds/room\")\n";
+        let issues = check_lifecycle_issues(script);
+        let tint_issues: Vec<_> = issues.iter().filter(|issue| issue.call_kind == LifecycleCallKind::Tint).collect();
+        assert_eq!(tint_issues.len(), 1);
+        assert_eq!(tint_issues[0].boundary_kind, "eof");
+    }
+
+    #[test]
+    fn eof_with_open_tint_is_flagged_like_a_boundary() {
+        let script = "tint(\"bg\", [0.55,0.6,0.68], 0)\n";
+        let issues = check_lifecycle_issues(script);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].call_kind, LifecycleCallKind::Tint);
+        assert_eq!(issues[0].boundary_kind, "eof");
+    }
+
+    fn wrap_in_sequence(body: &str) -> String {
+        format!("<|\n{}\n|>\n\n{body}\n\n<|\n{}\n|>\n", world_state::SEQUENCE_BEGIN_MARKER, world_state::SEQUENCE_END_MARKER)
+    }
+
+    #[test]
+    fn find_marker_lines_finds_all_occurrences_in_order() {
+        let script = "alpha\nbeta\nalpha\n";
+        let offsets = find_marker_lines(script, "alpha");
+        assert_eq!(offsets.len(), 2);
+        assert!(offsets[0] < offsets[1]);
+    }
+
+    #[test]
+    fn find_marker_lines_returns_empty_for_absent_marker() {
+        let script = "nothing here\n";
+        assert!(find_marker_lines(script, world_state::SEQUENCE_BEGIN_MARKER).is_empty());
+    }
+
+    #[test]
+    fn lifecycle_tracker_ignores_bg_switches_inside_sequence() {
+        let body = "show(\"bg\", \"cgs/a\")\nshow(\"bg\", \"cgs/b\")\nshow(\"bg\", \"cgs/c\")";
+        let script = wrap_in_sequence(body);
+        let issues = check_lifecycle_issues(&script);
+        assert!(issues.iter().all(|issue| issue.boundary_kind != "show_switch"));
+    }
+
+    #[test]
+    fn lifecycle_tracker_ignores_trans_calls_inside_sequence() {
+        let body = "tint(\"yuki\", [0.3,0.3,0.3], 0)\ntrans_fade(\"cam\", \"cgs/a\", 0.2)\ntrans_fade(\"cam\", \"cgs/b\", 0.2)";
+        let script = wrap_in_sequence(body);
+        let issues = check_lifecycle_issues(&script);
+        assert!(issues.iter().all(|issue| issue.boundary_kind != "trans_fade"));
+    }
+
+    #[test]
+    fn lifecycle_tracker_flushes_at_sequence_end_not_individual_switches() {
+        let body = "tint(\"yuki\", [0.3,0.3,0.3], 0)\ntrans_fade(\"cam\", \"cgs/a\", 0.2)";
+        let script = wrap_in_sequence(body);
+        let issues = check_lifecycle_issues(&script);
+        let tint_issues: Vec<_> = issues.iter().filter(|issue| issue.call_kind == LifecycleCallKind::Tint).collect();
+        assert_eq!(tint_issues.len(), 1);
+        assert_eq!(tint_issues[0].boundary_kind, "sequence_end");
+    }
+
+    #[test]
+    fn lifecycle_tracker_still_flushes_normally_outside_sequence_spans() {
+        let script = "tint(\"yuki\", [0.3,0.3,0.3], 0)\ntrans_fade(\"cam\", \"backgrounds/toilet\", 2)\n";
+        let issues = check_lifecycle_issues(script);
+        let tint_issues: Vec<_> = issues.iter().filter(|issue| issue.call_kind == LifecycleCallKind::Tint).collect();
+        assert_eq!(tint_issues.len(), 1);
+        assert_eq!(tint_issues[0].boundary_kind, "trans_fade");
+    }
+
+    #[test]
+    fn lifecycle_tracker_resumes_normal_boundary_detection_after_sequence_end() {
+        let seq_body = "show(\"bg\", \"cgs/a\")\nshow(\"bg\", \"cgs/b\")";
+        let script = format!(
+            "{}tint(\"yuki\", [0.3,0.3,0.3], 0)\ntrans_fade(\"cam\", \"backgrounds/toilet\", 2)\n",
+            wrap_in_sequence(seq_body)
+        );
+        let issues = check_lifecycle_issues(&script);
+        let tint_issues: Vec<_> = issues.iter().filter(|issue| issue.call_kind == LifecycleCallKind::Tint).collect();
+        assert_eq!(tint_issues.len(), 1);
+        assert_eq!(tint_issues[0].boundary_kind, "trans_fade");
+    }
+
+    #[test]
+    fn lifecycle_tracker_last_bg_fg_path_keeps_updating_during_suppressed_sequence() {
+        let seq_body = "show(\"bg\", \"cgs/a\")\nshow(\"bg\", \"cgs/b\")";
+        let script = format!("{}show(\"bg\", \"cgs/b\")\n", wrap_in_sequence(seq_body));
+        // The last bg shown inside the sequence is "cgs/b" - showing the *same* path again right
+        // after the sequence ends must NOT be treated as a switch.
+        let issues = check_lifecycle_issues(&script);
+        assert!(issues.iter().all(|issue| issue.boundary_kind != "show_switch"));
+    }
+
+    #[test]
+    fn flags_unclosed_performance_sequence() {
+        let script = format!("<|\n{}\n|>\nraw content\n", world_state::SEQUENCE_BEGIN_MARKER);
+        let issues = check_unclosed_sequences(&script);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].opened_at_line, 2);
+    }
+
+    #[test]
+    fn closed_sequence_yields_no_unclosed_sequence_issue() {
+        let script = wrap_in_sequence("raw content");
+        assert!(check_unclosed_sequences(&script).is_empty());
+    }
+
+    #[test]
+    fn multiple_sequences_in_one_script_all_correctly_paired() {
+        let script = format!("{}\n{}", wrap_in_sequence("first"), wrap_in_sequence("second"));
+        assert!(check_unclosed_sequences(&script).is_empty());
+    }
+
+    #[test]
+    fn unclosed_sequence_still_gets_eof_lifecycle_flush_as_fallback() {
+        let script = format!("<|\n{}\n|>\ntint(\"yuki\", [0.3,0.3,0.3], 0)\n", world_state::SEQUENCE_BEGIN_MARKER);
+        let issues = check_lifecycle_issues(&script);
+        assert!(issues.iter().any(|issue| issue.call_kind == LifecycleCallKind::Tint && issue.boundary_kind == "eof"));
+        assert_eq!(check_unclosed_sequences(&script).len(), 1);
+    }
+
+    #[test]
+    fn format_unclosed_sequence_issues_mentions_opened_line() {
+        let message = format_unclosed_sequence_issues(&[UnclosedSequenceIssue { opened_at_line: 7 }]);
+        assert!(message.contains('7'));
+    }
+
+    #[test]
+    fn formats_lifecycle_show_issue_with_line_and_object() {
+        let issues = vec![LifecycleIssue {
+            object: "yuki".to_string(),
+            call_kind: LifecycleCallKind::Show,
+            opened_at_line: 3,
+            boundary_line: 9,
+            boundary_kind: "trans_fade",
+            auto_fix: None,
+        }];
+        let message = format_lifecycle_issues(&issues);
+        assert!(message.contains("第3行"));
+        assert!(message.contains("第9行"));
+        assert!(message.contains("yuki"));
+        assert!(message.contains("trans_fade"));
+    }
+
+    #[test]
+    fn accepts_node_closed_via_is_end() {
+        let script = "@<|\nlabel(\"ch1_room\", \"宿舍\")\n|>\n<|\nshow(\"bg\", \"backgrounds/room\")\n|>\n你好。\n@<| is_end() |>\n";
+        assert!(check_terminal_closure(script).is_empty());
+    }
+
+    #[test]
+    fn accepts_node_closed_via_jump_to() {
+        let script = "@<|\nlabel(\"ch1_room\", \"宿舍\")\n|>\n你好。\n@<| jump_to(\"ch2\") |>\n";
+        assert!(check_terminal_closure(script).is_empty());
+    }
+
+    #[test]
+    fn accepts_node_closed_via_branch() {
+        let script = "@<|\nlabel(\"ch1_room\", \"宿舍\")\n|>\n你好。\n@<|\nbranch([\n    { dest=\"node_a\", text=\"A\" },\n])\n|>\n";
+        assert!(check_terminal_closure(script).is_empty());
+    }
+
+    #[test]
+    fn flags_last_node_with_no_closer() {
+        let script = "@<|\nlabel(\"ch1_room\", \"宿舍\")\n|>\n<|\nshow(\"bg\", \"backgrounds/room\")\n|>\n你好。\n";
+        let issues = check_terminal_closure(script);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].node_label, Some("ch1_room".to_string()));
+        assert_eq!(issues[0].label_line, 2);
+        assert_eq!(issues[0].last_content_line, 7);
+    }
+
+    #[test]
+    fn flags_single_implicit_node_script_with_no_label_at_all_and_no_closer() {
+        let script = "<|\nshow(\"bg\", \"backgrounds/room\")\n|>\n你好。\n";
+        let issues = check_terminal_closure(script);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].node_label, None);
+    }
+
+    #[test]
+    fn accepts_multi_node_script_where_only_last_node_matters() {
+        // ch1_room has no explicit closer, but it doesn't need one - the next node's label() call
+        // is itself the eager block that flushes ch1_room's trailing dialogue.
+        let script = "@<|\nlabel(\"ch1_room\", \"宿舍\")\n|>\n你好。\n\n@<|\nlabel(\"ch1_hall\", \"走廊\")\n|>\n再见。\n@<| is_end() |>\n";
+        assert!(check_terminal_closure(script).is_empty());
+    }
+
+    #[test]
+    fn closure_call_starts_do_not_match_inside_longer_identifiers() {
+        let starts = find_call_starts("sub_label(1)\nlabel(\"ch1\")\n", "label");
+        assert_eq!(starts.len(), 1);
+    }
+
+    #[test]
+    fn formats_terminal_closure_issue_with_suggested_fix() {
+        let issues = vec![TerminalClosureIssue {
+            node_label: Some("ch1_room".to_string()),
+            label_line: 2,
+            last_content_line: 7,
+        }];
+        let message = format_terminal_closure_issues(&issues);
+        assert!(message.contains("ch1_room"));
+        assert!(message.contains("第7行"));
+        assert!(message.contains("is_end()"));
     }
 }
