@@ -6,8 +6,9 @@ mod version_history;
 mod world_state;
 
 use generation::{
-    apply_lifecycle_autofixes, build_autostage_prompt, build_generation_prompt, build_retry_prompt,
-    build_summary_prompt, check_terminal_closure, check_unclosed_sequences, find_unknown_asset_paths,
+    apply_lifecycle_autofixes, apply_position_conflict_fixes, build_autostage_prompt,
+    build_generation_prompt, build_retry_prompt, build_summary_prompt, check_terminal_closure,
+    check_unclosed_sequences, find_unknown_asset_paths,
     find_unknown_audio_tracks, find_unknown_shaders, find_unknown_sound_tracks, format_asset_path_issues,
     format_audio_track_issues, format_lifecycle_issues, format_shader_issues, format_sound_track_issues,
     format_terminal_closure_issues, format_unclosed_sequence_issues, generate_with_prompt,
@@ -957,6 +958,7 @@ impl AppRuntime {
             // boundary) get patched in directly here, for free - no model round trip needed since
             // the "closed" value is unambiguous. This happens before validation/write so every
             // downstream step (asset checks, draft write, reload) sees the patched script.
+            let script = apply_position_conflict_fixes(&script);
             let (script, lifecycle_issues) = apply_lifecycle_autofixes(&script);
             register_new_characters(nova2_project_dir, &new_chars)?;
             self.write_scenario_file_draft(&request.target_file, &script)?;

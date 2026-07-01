@@ -736,6 +736,135 @@ pub(crate) fn check_lifecycle_issues(script: &str) -> Vec<LifecycleIssue> {
     issues
 }
 
+/// Position slot for a character sprite, bucketed from the x component of show()'s `coord`.
+/// Thresholds are intentionally coarse: a character placed at x=-0.4 and another at x=-0.25
+/// are both "Left" and will trigger conflict detection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum PositionSlot { Left, Center, Right }
+
+fn x_to_slot(x: f32) -> PositionSlot {
+    if x < -0.15 { PositionSlot::Left }
+    else if x > 0.15 { PositionSlot::Right }
+    else { PositionSlot::Center }
+}
+
+/// Extracts the x component from a coord array literal that starts at `rest`, e.g.
+/// `[0.35, -0.3, 0.53, 0, 0]` → `Some(0.35)`. Returns `None` for `null` or anything that
+/// isn't a numeric literal at the first position.
+fn parse_coord_x(rest: &str) -> Option<f32> {
+    let s = rest.trim_start();
+    let inner = s.strip_prefix('[')?.trim_start();
+    let x_str: String = inner.chars().take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '-').collect();
+    x_str.parse::<f32>().ok()
+}
+
+/// Skips past a quoted arg and the comma that follows it. Returns the slice after the comma,
+/// trimmed. Returns None if no comma follows (i.e. there is no next argument).
+fn skip_to_next_arg<'a>(after_quoted: &'a str) -> Option<&'a str> {
+    let comma = after_quoted.find(',')?;
+    Some(after_quoted[comma + 1..].trim_start())
+}
+
+/// Scene objects that are never character sprites: bg/fg take a full image path as the 2nd arg
+/// (not a pose alias), and cam has no visual "body" to fade. Only objects outside this list and
+/// with a coordinate that implies a position slot are subject to conflict detection.
+const SCENE_OBJECTS: [&str; 3] = ["bg", "fg", "cam"];
+
+/// Detects show() calls that place a new character sprite at a position slot (Left/Center/Right,
+/// inferred from the x value of the coord argument) already occupied by a *different* character.
+/// When this happens, inserts a quick fade-out + hide() before the new show() so the previous
+/// occupant exits cleanly. The "fade" is `tint(prev, [1,1,1,0], 0.3)` immediately followed by
+/// `hide(prev)` + a tint reset - the tween may be visually cut short (both calls are in the same
+/// GDScript frame), but the state is always clean for the next appearance. For a fully animated
+/// exit the model should add entry-chained wait() calls via a `#hnt:` requirement.
+///
+/// hide() calls clear the occupancy map, so a character that's explicitly hidden before another
+/// arrives at the same slot doesn't trigger a spurious conflict.
+pub fn apply_position_conflict_fixes(script: &str) -> String {
+    // Collect show() and hide() events sorted by byte offset so we process them in document order.
+    enum SlotEvent<'a> {
+        Show { obj: &'a str, slot: PositionSlot, offset: usize },
+        Hide { obj: &'a str },
+    }
+    let mut events: Vec<(usize, SlotEvent)> = Vec::new();
+
+    for call_start in find_call_starts(script, "show") {
+        let rest = &script[call_start..];
+        let Some((obj, after_obj)) = extract_quoted_arg(rest) else { continue };
+        if SCENE_OBJECTS.contains(&obj) { continue }
+        // Skip the image-path/pose second arg.
+        let Some(after_path_start) = skip_to_next_arg(after_obj) else { continue };
+        let after_path = if after_path_start.starts_with('"') || after_path_start.starts_with('\'') {
+            let Some((_, rest2)) = extract_quoted_arg(after_path_start) else { continue };
+            rest2
+        } else if after_path_start.starts_with("null") {
+            &after_path_start[4..]
+        } else {
+            continue
+        };
+        // Third arg is coord.
+        let Some(coord_start) = skip_to_next_arg(after_path) else { continue };
+        if !coord_start.starts_with('[') { continue } // null coord → no position
+        let Some(x) = parse_coord_x(coord_start) else { continue };
+        events.push((call_start, SlotEvent::Show { obj, slot: x_to_slot(x), offset: call_start }));
+    }
+
+    for call_start in find_call_starts(script, "hide") {
+        let rest = &script[call_start..];
+        let Some((obj, _)) = extract_quoted_arg(rest) else { continue };
+        events.push((call_start, SlotEvent::Hide { obj }));
+    }
+
+    events.sort_by_key(|(offset, _)| *offset);
+
+    // Walk events in order, tracking which character occupies each slot.
+    let mut slot_occupant: std::collections::HashMap<PositionSlot, String> = std::collections::HashMap::new();
+    // (line number 1-indexed, text to insert before that line) - collected for bottom-to-top splice.
+    let mut insertions: Vec<(usize, String)> = Vec::new();
+
+    for (_, event) in &events {
+        match event {
+            SlotEvent::Show { obj, slot, offset } => {
+                // Remove this obj from any slot it previously occupied (it's moving).
+                slot_occupant.retain(|_, v| v != obj);
+                if let Some(prev) = slot_occupant.get(slot) {
+                    if prev != obj {
+                        let prev_owned = prev.clone();
+                        let line = byte_offset_to_line(script, *offset);
+                        insertions.push((
+                            line as usize,
+                            format!(
+                                "# 自动退场（{prev_owned} 原先占用该位置）\ntint(\"{prev_owned}\", [1,1,1,0], 0.3)\nhide(\"{prev_owned}\")\ntint(\"{prev_owned}\", [1,1,1,1], 0)"
+                            ),
+                        ));
+                    }
+                }
+                slot_occupant.insert(*slot, obj.to_string());
+            }
+            SlotEvent::Hide { obj } => {
+                slot_occupant.retain(|_, v| v != obj);
+            }
+        }
+    }
+
+    if insertions.is_empty() {
+        return script.to_string();
+    }
+
+    // Apply insertions bottom-to-top so earlier ones don't shift the line numbers later ones
+    // still reference. Within each insertion, lines are inserted sequentially (offset 0,1,2,...)
+    // at consecutive positions so they land in the correct order.
+    insertions.sort_by_key(|(line, _)| std::cmp::Reverse(*line));
+    let mut lines: Vec<String> = script.lines().map(str::to_string).collect();
+    for (line_num, text) in insertions {
+        let insert_at = (line_num.saturating_sub(1)).min(lines.len());
+        for (offset, insert_line) in text.lines().enumerate() {
+            lines.insert(insert_at + offset, insert_line.to_string());
+        }
+    }
+    lines.join("\n")
+}
+
 /// Splits `check_lifecycle_issues` findings into mechanical fixes (tint/env_tint/vfx/audio - one
 /// unambiguous closed value, applied directly with no model round trip) and judgment calls (show -
 /// returned for the caller to feed back to the model). Mid-script fixes are inserted as bare lines
@@ -2165,5 +2294,47 @@ mod tests {
         assert!(message.contains("ch1_room"));
         assert!(message.contains("第7行"));
         assert!(message.contains("is_end()"));
+    }
+
+    // --- position-conflict auto-fix ---
+
+    #[test]
+    fn inserts_fade_exit_when_different_character_placed_at_same_slot() {
+        // xiben is placed center (x=0), then qianye is placed center (x=0) → xiben should exit.
+        let script = "<|\nshow(\"xiben\", \"normal\", [0, 0, 0.5, 0, 0])\n|>\n台词A。\n\n<|\nshow(\"qianye\", \"normal\", [0, 0, 0.5, 0, 0])\n|>\n台词B。\n\n@<| is_end() |>\n";
+        let patched = apply_position_conflict_fixes(script);
+        assert!(patched.contains("hide(\"xiben\")"), "should have inserted hide for previous occupant");
+        assert!(patched.contains("tint(\"xiben\", [1,1,1,0], 0.3)"), "should tint to transparent first");
+        // The new show must still be present.
+        assert!(patched.contains("show(\"qianye\""));
+    }
+
+    #[test]
+    fn no_conflict_when_same_character_moved_within_same_slot() {
+        // xiben stays at center (different pose) - no conflict.
+        let script = "<|\nshow(\"xiben\", \"normal\", [0, 0, 0.5, 0, 0])\n|>\n台词A。\n\n<|\nshow(\"xiben\", \"happy\", [0, 0, 0.5, 0, 0])\n|>\n台词B。\n\n@<| is_end() |>\n";
+        let patched = apply_position_conflict_fixes(script);
+        assert!(!patched.contains("hide(\"xiben\")"));
+    }
+
+    #[test]
+    fn no_conflict_after_explicit_hide_frees_slot() {
+        // xiben is shown center, then explicitly hidden, then qianye is placed center - no conflict.
+        let script = "<|\nshow(\"xiben\", \"normal\", [0, 0, 0.5, 0, 0])\n|>\n台词A。\n\n<|\nhide(\"xiben\")\nshow(\"qianye\", \"normal\", [0, 0, 0.5, 0, 0])\n|>\n台词B。\n\n@<| is_end() |>\n";
+        let patched = apply_position_conflict_fixes(script);
+        // No auto-inserted hide should appear before the show of qianye (the explicit hide above is enough).
+        let qianye_pos = patched.find("show(\"qianye\"").unwrap();
+        let before_qianye = &patched[..qianye_pos];
+        // The only hide(xiben) present should be the original explicit one, not an auto-inserted duplicate.
+        assert_eq!(before_qianye.matches("hide(\"xiben\")").count(), 1);
+    }
+
+    #[test]
+    fn left_and_right_slots_are_independent() {
+        // xiben left (x=-0.35), ergong right (x=0.35) - no conflict even though both placed.
+        let script = "<|\nshow(\"xiben\", \"normal\", [-0.35, 0, 0.5, 0, 0])\nshow(\"ergong\", \"normal\", [0.35, 0, 0.5, 0, 0])\n|>\n台词。\n\n@<| is_end() |>\n";
+        let patched = apply_position_conflict_fixes(script);
+        assert!(!patched.contains("hide(\"xiben\")"));
+        assert!(!patched.contains("hide(\"ergong\")"));
     }
 }
