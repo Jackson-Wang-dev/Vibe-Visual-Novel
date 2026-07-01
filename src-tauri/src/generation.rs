@@ -1234,23 +1234,7 @@ pub fn build_generation_prompt(
     })?;
 
     let mut sections = vec![
-        "你现在要为 Nova2 编辑/生成可直接保存为 .txt 的 NovaScript 剧本。严格遵守下面提供的参考文档与约束；在动笔前必须把下方的 NovaScript 参考文档、动画/VFX 说明、已知资源清单与“目标文件当前内容”当作唯一工程事实来使用，不得凭记忆假设 API、资源、角色或演出规则。输出必须满足以下规则：\n\
-        1. 默认只输出脚本文本本身，不要输出解释、标题、Markdown 代码块或围栏。\n\
-        2. 如果脚本需要声明新的角色节点，允许在第一行单独输出一行 `#NEWCHARS: [{\"node\":\"...\",\"bind\":\"...\",\"folder\":\"...\"}]`，除此之外不要输出任何额外元信息。\n\
-        3. `#NEWCHARS:` 如果出现，必须是整个回复的第一行，后面紧跟合法 JSON 数组。\n\
-        4. `#NEWCHARS:` 之后从第二行开始输出完整脚本文本。\n\
-        5. 最终脚本必须能被引擎直接重载解析。\n\
-        6. 下面“目标文件当前内容”一节如果不为空，必须当成唯一真实状态对待：你的任务是在这份内容基础上只修改用户需求里明确要求的那部分，其余文字（台词、函数调用、角色名、背景/资源路径、label 名等）必须逐字保留，禁止整体重写、禁止臆造新的开场或替换掉没被要求修改的内容。\n\
-        7. 只能使用“已知角色绑定名”列表中已经存在的名字，或当前内容/参考文档里已经出现过的名字；不要发明列表之外、读起来很像但不存在的角色名（例如把“二宫”写成别的名字）。确实需要全新角色时才通过 `#NEWCHARS` 声明。\n\
-        8. 只有当“目标文件当前内容”一节为空（目标文件不存在或本来就是新文件）时，才允许从零开始生成全新内容。\n\
-        9. 默认禁止修改对话台词文本本身（说话人说的话、旁白文字），也不允许新增、删除或合并对话行——除非“用户需求”里明确写出了要修改的具体台词内容，或明确使用了“改台词”“改文本”“改对话”一类的措辞。对话台词以外的部分（背景/灯光/特效 vfx、动画 anim、转场、镜头、音乐音效等函数调用与参数）不受此限制，可以按需修改。\n\
-        10. 当用户需求描述的是氛围、情绪、天气、打光、节奏等“演出效果”类诉求（例如“氛围更忧郁一点”“贴合雨天”），必须通过调整或新增 vfx/anim/转场/灯光/环境音等函数调用来实现，绝对不能借此改写台词文字；如果实现该效果确实需要某一行台词配合（极少数情况），必须先确认这正是“用户需求”明确要求的，否则保持台词原样。\n\
-        11. `tint`/`env_tint`/`vfx`/`move` 等调用会持久化生效（属性状态不会自动过期），不存在自动“离开场景就还原”的机制。如果本次新增/修改的是这类持久化效果，必须检查“目标文件当前内容”里改动位置之后是否存在切换到不同地点的场景边界（典型信号：之后出现 `trans_fade`/`trans`/`trans_left`/`trans_right`/`trans_up`/`trans_down`，或又一次 `show(\"bg\", 不同路径)` / `show(\"fg\", 不同路径)` 而中间没有先 `hide`/还原）；如果存在这种边界，必须在该边界调用之前补一条还原调用（例如把 `tint` 还原回 `[1,1,1,1]` 或场景原本的色调），避免效果泄漏到下一个不相关的场景。例如：在“学生会办公室”场景加了 `tint(\"bg\", [0.55,0.6,0.68], 0)`，但后面出现了 `trans_fade(\"cam\", func(): show(\"bg\", \"backgrounds/toilet\"), 2)` 切到另一个地点，就必须在这条 `trans_fade` 之前还原 `tint`。如果改动本身已经在文件末尾或后面没有切换到不同地点，则不需要画蛇添足地加还原。同样的道理也适用于场景*内部*的情绪起伏：如果是为了表现冲突升级而逐步加深了某个持久化效果（例如随着对峙升温反复加深 `tint`），在剧情明确出现缓和/转折点（冲突被打断、主角夺回主动权、对方退让等）时，也要让该效果相应地往回收一些，不能任由它只升不降、一路保持到很久之后才在场景末尾一次性清零——效果的强弱要跟着叙事张力的起落走，不是只跟开头/结尾绑定。\n\
-        12. 只能引用真实存在的资源路径：”已知背景资源路径”列表之外、看起来像是合理猜测但实际不存在的路径（例如把 `backgrounds/room` 简写成 `room`）禁止使用；非角色对象（如 bg/fg）的 `show`/`trans*` 图片路径必须原样取自该列表或当前内容里已经出现过的路径；角色对象（如 ergong/gaotian 等绑定名）的 `show` 第二个参数必须是「已知角色 pose 别名」里列出的别名（如 normal/cry），不能使用 standings/ 路径——那是引擎内部的合成图层路径，不是 NovaScript 的 API 参数。\n\
-        13. 同理，`play`/`fade_in` 的曲目名必须原样取自“已知音轨”列表里对应 channel 下的曲目；`sound()` 的音效名必须原样取自“已知音效”列表；`vfx()` 的 shader 名必须原样取自“已知 VFX shader”列表。这几类资源都不允许凭语感/常见叫法臆造（例如想要心跳音效但项目里根本没有对应文件，就不要写 `sound(\"heartbeat\", ...)`；想要噪点效果但项目里只有 `noise.gdshaderinc`〔头文件，不能直接用〕没有独立的 `noise.gdshader`，就不要写 `vfx(\"cam\", \"noise\", ...)`）。如果列表里确实没有合适的现成资源，宁可放弃这个细节或换一种已有资源能实现的方案，也不要编一个不存在的名字。\n\
-        14. `entry` 参数是 NovaScript 唯一的“排队/排序”机制：同一个 `<| ... |>` block 里的语句是 GDScript 立即顺序执行的，并不会真的等待——`wait(duration)`/`vfx(...)`/`move(...)` 等返回的是一个可以继续往后链的“链尾”，但只有当你把这个返回值显式接住并传给下一步调用的 `entry` 参数时，下一步才会真的排在“等待结束之后”；如果某一步调用的 `wait(...)` 返回值没有被接住传下去，后面那些仍然用默认 `entry`（`o.anim` 根）的调用会和前面的调用同时触发，而不是按你写的先后顺序播放，等于前面的 `wait` 完全没有效果。需要在同一个 block 内对同一个 obj/层先做 A、停顿、再做 B 时，必须像这样显式链接：`var e = vfx(\"cam\", \"glitch\", 0.9, 0.05)\ne = wait(0.05, e)\ne = vfx(\"cam\", \"glitch\", 0, 0.06, null, e)`（可参考 ch4.txt 的 `hold_entry`/`end_entry` 写法）。另外，`vfx(\"cam\", shader_layer, ...)` 在不指定 `layer_id` 时默认都落在 layer 0：如果同一时间窗口内连续对 `\"cam\"` 调用了两个不同的 shader 名而没有用 `[名字, layer_id]` 区分层，后调用的会直接顶替/覆盖前一个绑定在该层的 shader，不会叠加生效——需要同时叠加多个画面特效时要显式分配不同的 layer_id（0~3）。\n\
-        15. 立绘横向位置（x 轴）和 scale 的典型参考值——本项目坐标系中 x=0.6 左右已经是刻意制造的「重叠」范围，x 绝对值小于 1 的多人布局会导致立绘明显折叠，应避免。常用布局：单人居中 x=0, scale 约 0.53；两人并排 x 约 -2 和 2，scale 约 0.53；三人 x 约 -2.5/0/2.5；四人 x 约 -3/-1/1/3，scale 约 0.4。从画外进入时惯用 x=4 或 x=-4 作为起始再 move 到目标位置。scale 本身改动要格外谨慎：这类构图效果没法在不实际渲染的情况下被准确验证，大幅提高 scale（比如从 0.53 跳到 1.05）很容易把角色头部推出画面之外。默认以该对象在”目标文件当前内容”里最近一次 show/move 设定的 (x, y, scale) 作为基准，只做小幅调整（变化幅度控制在 30%~40% 以内），除非用户明确要求大幅推近镜头。\n\
-        16. `tint`/`env_tint` 绝对不能把 `\"cam\"` 当作 `obj` 使用：这两个函数对非立绘对象固定走 `modulate` 属性（`tint`）或要求对象有 `CurrentPose`（`env_tint`），而 `\"cam\"` 绑定的是 `Camera3D`，没有 `modulate` 属性——`tint(\"cam\", ...)` 在引擎里会直接抛 `NullReferenceException` 崩掉那个 tween，不是警告或静默失败。`tint`/`env_tint` 只能用在 `\"bg\"`/`\"fg\"`/角色立绘对象上。需要给整个镜头/画面叠加颜色（比如“脸色一变、画面泛红”这类需求）时，必须用 `vfx(\"cam\", [\"color\", layer_id], t, duration, { \"_ColorMul\": ... })`（`layer_id` 选一个当前没被占用的 0~3 层，参考规则 14）。".to_string(),
+        "You are editing or generating a NovaScript script for Nova2 that will be saved as a .txt file.\n        Treat the NovaScript reference, animation/VFX notes, known-resource lists, and the current file content below as the sole ground truth.\n        Output must satisfy all of the following rules:\n        1. By default output only the script text itself. No explanations, titles, Markdown code fences, or wrappers.\n        2. If the script needs to declare new character nodes, you may output a single `#NEWCHARS: [{\"node\":\"...\",\"bind\":\"...\",\"folder\":\"...\"}]` line as the very first line of your response. No other metadata is allowed.\n        3. If `#NEWCHARS:` appears it must be the entire first line followed immediately by a valid JSON array.\n        4. After `#NEWCHARS:` the complete script starts on line 2.\n        5. The final script must be directly reloadable by the engine without errors.\n        6. If the Current File Content section below is non-empty, treat it as the sole ground truth: only modify what the user request explicitly asks for. Preserve everything else verbatim (dialogue, function calls, character names, resource paths, label names). Never rewrite wholesale or invent new content for sections not requested.\n        7. Only use character bind names from the Known Character Bind Names list, or names already present in the current content or reference docs. Do not invent plausible-sounding names outside the list. Use `#NEWCHARS` only for genuinely new characters.\n        8. Only generate content from scratch when the Current File Content section is empty (the file does not exist or is intentionally new).\n        9. By default do not modify dialogue text (what characters say, narration). Do not add, delete, merge, or reorder dialogue lines unless the user request explicitly names specific dialogue to change or uses phrasing like \"change the line\" or \"rewrite dialogue\". Non-dialogue elements (background/lighting/vfx/anim/transition/camera/music function calls and parameters) may be changed freely.\n        10. When the user request describes atmosphere, mood, weather, lighting, or pacing, implement it through vfx/anim/transition/lighting/ambient function adjustments - never by rewriting dialogue. If a specific dialogue line is truly needed (rare), confirm the user explicitly requested it; otherwise keep dialogue unchanged.\n        11. tint/env_tint/vfx/move etc. are persistent (state does not expire automatically). If this edit adds or modifies such effects, check whether any scene boundary exists after the edit point in the current content (signal: subsequent trans_fade/trans_left/trans_right/trans_up/trans_down, or another show(\"bg\", different_path)/show(\"fg\", different_path) without a hide/restore in between). If a boundary exists, add a restore call before it to prevent effect leakage into the next unrelated scene. This also applies within a scene: if an effect was gradually deepened to reflect escalating tension, roll it back at the narrative turning point - effects should track narrative tension, not just the file start/end.\n        12. Only reference paths that actually exist. Paths not in the Known Background Asset Paths list are forbidden even as plausible guesses. Non-character objects (bg/fg) show/trans* image paths must come from that list or from paths already in the current content. Character objects (bind names like ergong/gaotian) show() second argument must be a pose alias from Known Character Pose Aliases (e.g. normal/cry) - never a standings/ path, which is an internal engine composite-sprite path.\n        13. Likewise: play/fade_in track names from Known Audio Tracks; sound() names from Known Sound Effects; vfx() shader names from Known VFX Shaders. Never invent names from intuition or convention. If no suitable resource exists, skip the detail or use an existing resource rather than fabricating a name.\n        14. The entry parameter is NovaScript's only sequencing mechanism: statements in a `<| ... |>` block execute immediately in GDScript order - they do not wait for each other. wait()/vfx()/move() etc. return a chain tail; only passing that value to the next call's entry schedules it after the wait, otherwise everything fires simultaneously from the animation root. To chain A then pause then B on the same object: `var e = vfx(\"cam\", \"glitch\", 0.9, 0.05)\ne = wait(0.05, e)\ne = vfx(\"cam\", \"glitch\", 0, 0.06, null, e)`. Also vfx(\"cam\", shader_layer, ...) defaults to layer 0; use explicit layer_ids (0-3) to stack multiple screen effects without overwriting each other.\n        15. Coordinate array format for show(): must be exactly 5 elements [x, y, scale, rx, ry]. Missing any element causes out-of-bounds engine failure and the character will not appear. y is typically -0.3, rx/ry typically 0. Example: show(bind_name, pose_alias, [-2, -0.3, 0.53, 0, 0]). Typical layouts: single center [0,-0.3,0.53,0,0]; two at [-2,-0.3,0.53,0,0] and [2,-0.3,0.53,0,0]; three at ~-2.5/0/2.5; four at ~-3/-1/1/3 scale~0.4. Enter from off-screen with x=4 or x=-4 then move(). x=0.6 is deliberate overlap territory - avoid |x|<1 for multi-character layouts. Keep scale changes within 30-40% of baseline unless a close-up is explicitly requested.\n        16. Never use \"cam\" as the obj for tint/env_tint: \"cam\" is Camera3D with no modulate property - tint(\"cam\",...) throws NullReferenceException and crashes the tween, it is not a silent failure. tint/env_tint only work on bg/fg/character objects. For whole-screen color overlay use vfx(\"cam\", [\"color\", layer_id], t, duration, {\"_ColorMul\": ...}).".to_string(),
         format!("## NovaScript 参考文档\n\n{reference_text}"),
     ];
 
@@ -1331,9 +1315,9 @@ pub fn build_generation_prompt(
 
     let existing_content = existing_content.trim();
     sections.push(format!(
-        "## 目标文件 {target_file} 当前内容\n\n{}",
+        "## Current Content of Target File {target_file}\n\n{}",
         if existing_content.is_empty() {
-            "(空 - 这是一个不存在的新文件)".to_string()
+            "(empty - this file does not exist yet)".to_string()
         } else {
             existing_content.to_string()
         }
@@ -1450,21 +1434,7 @@ pub fn build_autostage_prompt(
     })?;
 
     let mut sections = vec![
-        "你现在要为 Nova2 把一份纯对话剧本（已经搭好结构骨架，台词逐字保留）补全成完整可播放的 NovaScript 演出剧本。严格遵守下面提供的参考文档与约束；在动笔前必须把下方的 NovaScript 参考文档、已知资源清单、世界状态时间线与“节点骨架”当作唯一工程事实来使用，不得凭记忆假设 API、资源、角色或演出规则。输出必须满足以下规则：\n\
-        1. 默认只输出脚本文本本身，不要输出解释、标题、Markdown 代码块或围栏。\n\
-        2. 如果台词涉及的说话人不在“已知角色绑定名”列表里，允许在第一行单独输出一行 `#NEWCHARS: [{\"node\":\"...\",\"bind\":\"...\",\"folder\":\"...\"}]`，除此之外不要输出任何额外元信息。\n\
-        3. `#NEWCHARS:` 如果出现，必须是整个回复的第一行，后面紧跟合法 JSON 数组。\n\
-        4. `#NEWCHARS:` 之后从第二行开始输出完整脚本文本。\n\
-        5. 最终脚本必须能被引擎直接重载解析。\n\
-        6. 下面“节点骨架”一节已经搭好了 label/jump_to/is_end/branch 等结构性 eager 调用和节点划分，必须逐字保留——只能在每个 `<| ... |>` 占位块内部把里面的占位注释替换/扩展成真正的演出函数调用，不能修改、删除、移动骨架里的结构性调用或节点划分本身，也不能新增/删除节点。如果某个占位块里除了 TODO 注释外还有一行“演出要求：...”的注释，这是用户写在剧本里、必须满足的具体技术要求（例如指定音乐、动画），必须把它落实成对应的函数调用，不能忽略、不能只当成参考建议自由发挥；占位块里没有这行注释的，才完全由你自行决定演出内容。如果某个占位块的位置被替换成了 `# vvn:seq begin` / `# vvn:seq end` 包裹的内容，这是作者自己手写好的完整演出代码（不是占位符），必须原样保留，一个字符都不能改动，也不能在这两行之间补充、删除或调整任何内容——这部分内容已经是“成品”，不需要你处理，也不允许你处理。\n\
-        7. 骨架里每个占位块后面紧跟的一行台词文本必须逐字保留，不能改写、增删、合并或调整顺序——这次任务只是在台词前后补演出，不是改台词。\n\
-        8. 只能对“世界状态时间线”里标注为在场的角色对象进行 show/tint/move 等操作；不要凭空引入时间线之外、本次没有登场的角色。背景切换的时机由世界状态时间线里每一拍标注的背景决定——你只负责把对应的 show 调用放在正确的占位块里，不需要、也不能自行决定要不要切换背景、要不要拆分节点；节点划分（label/jump_to/branch 的结构和数量）已经由骨架确定，不是你这一步要考虑的事。\n\
-        9. 只能引用真实存在的资源路径：”已知背景资源路径”列表之外、看起来像是合理猜测但实际不存在的路径（例如把 `backgrounds/room` 简写成 `room`）禁止使用；非角色对象（如 bg/fg）的 `show`/`trans*` 图片路径必须原样取自该列表，世界状态时间线里标注的背景路径也必须原样使用；角色对象（如 ergong/gaotian 等绑定名）的 `show` 第二个参数必须是「已知角色 pose 别名」里列出的别名（如 normal/cry），不能使用 standings/ 路径——那是引擎内部的合成图层路径，不是 NovaScript 的 API 参数。\n\
-        10. 同理，`play`/`fade_in` 的曲目名必须原样取自“已知音轨”列表里对应 channel 下的曲目；`sound()` 的音效名必须原样取自“已知音效”列表；`vfx()` 的 shader 名必须原样取自“已知 VFX shader”列表。这几类资源都不允许凭语感/常见叫法臆造。如果列表里确实没有合适的现成资源，宁可放弃这个细节或换一种已有资源能实现的方案，也不要编一个不存在的名字。\n\
-        11. `entry` 参数是 NovaScript 唯一的“排队/排序”机制：同一个 `<| ... |>` block 里的语句是 GDScript 立即顺序执行的，并不会真的等待——`wait(duration)`/`vfx(...)`/`move(...)` 等返回的是一个可以继续往后链的“链尾”，但只有当你把这个返回值显式接住并传给下一步调用的 `entry` 参数时，下一步才会真的排在“等待结束之后”；如果某一步调用的 `wait(...)` 返回值没有被接住传下去，后面那些仍然用默认 `entry`（`o.anim` 根）的调用会和前面的调用同时触发，而不是按你写的先后顺序播放，等于前面的 `wait` 完全没有效果。需要在同一个 block 内对同一个 obj/层先做 A、停顿、再做 B 时，必须像这样显式链接：`var e = vfx(\"cam\", \"glitch\", 0.9, 0.05)\ne = wait(0.05, e)\ne = vfx(\"cam\", \"glitch\", 0, 0.06, null, e)`。另外，`vfx(\"cam\", shader_layer, ...)` 在不指定 `layer_id` 时默认都落在 layer 0：需要同时叠加多个画面特效时要显式分配不同的 layer_id（0~3）。\n\
-        12. 立绘横向位置（x 轴）和 scale 的典型参考值——本项目坐标系中 x=0.6 左右已经是刻意制造的「重叠」范围，x 绝对值小于 1 的多人布局会导致立绘明显折叠，应避免。常用布局：单人居中 x=0, scale 约 0.53；两人并排 x 约 -2 和 2，scale 约 0.53；三人 x 约 -2.5/0/2.5；四人 x 约 -3/-1/1/3，scale 约 0.4。从画外进入时惯用 x=4 或 x=-4 作为起始再 move 到目标位置。scale 本身的改动要格外谨慎：默认以已知内容里最近一次同类调用设定的 (x, y, scale) 作为基准，只做小幅调整（变化幅度建议控制在 30%~40% 以内），除非确有必要大幅推近镜头。\n\
-        13. `tint`/`env_tint` 绝对不能把 `\"cam\"` 当作 `obj` 使用：`\"cam\"` 绑定的是 `Camera3D`，没有 `modulate` 属性——`tint(\"cam\", ...)` 在引擎里会直接抛异常崩掉那个 tween。`tint`/`env_tint` 只能用在 `\"bg\"`/`\"fg\"`/角色立绘对象上；需要给整个镜头叠加颜色时改用 `vfx(\"cam\", [\"color\", layer_id], t, duration, { \"_ColorMul\": ... })`。\n\
-        14. `tint`/`env_tint`/`vfx`/`play` 等持久化效果跨场景边界的收尾，不需要你刻意操心——这部分已经由确定性代码事后扫描并自动修复或单独提示，你只需要专注于这一拍该有的演出本身，不必为了“怕泄漏”而在每个场景末尾画蛇添足地补一堆还原调用。".to_string(),
+        "You are filling in a pre-structured NovaScript skeleton for Nova2 - the dialogue is already in place; your job is to add the staging.\n        Treat the NovaScript reference, known-resource lists, world state timeline, and node skeleton below as the sole ground truth.\n        Output must satisfy all of the following rules:\n        1. Output only the script text itself. No explanations, titles, Markdown code fences, or wrappers.\n        2. If any speaker in the dialogue is not in the Known Character Bind Names list, you may output a single `#NEWCHARS: [{\"node\":\"...\",\"bind\":\"...\",\"folder\":\"...\"}]` line as the very first line. No other metadata is allowed.\n        3. If `#NEWCHARS:` appears it must be the entire first line followed immediately by a valid JSON array.\n        4. After `#NEWCHARS:` the complete script starts on line 2.\n        5. The final script must be directly reloadable by the engine without errors.\n        6. The Node Skeleton section below has already established all structural eager calls (label/jump_to/is_end/branch) and node boundaries - preserve them verbatim. Your only job is to replace or expand the placeholder comments inside each `<| ... |>` block with real staging function calls. Do not modify, delete, or move any structural calls or node splits, and do not add or remove nodes. If a placeholder block contains a Staging Requirement line in addition to the TODO comment, that is a concrete technical requirement written by the author (e.g. specifying music or animation) - fulfill it with the corresponding function call; do not ignore it or treat it as a loose suggestion. If a placeholder block has been replaced with content wrapped in `# vvn:seq begin` / `# vvn:seq end`, that is complete author-written staging code - preserve it character-for-character; do not add, remove, or alter anything between those two lines.\n        7. Every dialogue line immediately following a placeholder block in the skeleton must be preserved verbatim. Do not rewrite, add, delete, merge, or reorder them. This task adds staging around dialogue, it does not rewrite dialogue.\n        8. Only apply show/tint/move operations to character objects listed as on-stage in the World State Timeline for that beat. Do not introduce characters absent from the timeline. Background switches are determined by the background annotation on each timeline beat - place the corresponding show call in the correct placeholder block; do not decide independently whether to switch backgrounds or split nodes. Node structure (label/jump_to/branch count and layout) is already fixed by the skeleton.\n        9. Only reference paths that actually exist. Paths not in the Known Background Asset Paths list are forbidden even as plausible guesses (e.g. do not shorten backgrounds/room to room). Non-character objects (bg/fg) show/trans* image paths must come from that list; world-state-annotated background paths must be used verbatim. Character objects (bind names like ergong/gaotian) show() second argument must be a pose alias from Known Character Pose Aliases (e.g. normal/cry) - never a standings/ path, which is an internal engine composite-sprite path, not a NovaScript API parameter.\n        10. Likewise: play/fade_in track names from Known Audio Tracks; sound() names from Known Sound Effects; vfx() shader names from Known VFX Shaders. Never invent names from intuition. If no suitable resource exists, skip the detail or use an existing resource.\n        11. The entry parameter is NovaScript's only sequencing mechanism: statements in a `<| ... |>` block execute immediately in GDScript order - they do not wait for each other. wait()/vfx()/move() etc. return a chain tail; only passing that value to the next call's entry schedules it after the wait. To chain A then pause then B: `var e = vfx(\"cam\", \"glitch\", 0.9, 0.05)\ne = wait(0.05, e)\ne = vfx(\"cam\", \"glitch\", 0, 0.06, null, e)`. vfx(\"cam\", shader_layer, ...) defaults to layer 0; use explicit layer_ids (0-3) to stack multiple effects.\n        12. Coordinate array format for show(): must be exactly 5 elements [x, y, scale, rx, ry]. Missing any element causes out-of-bounds engine failure and the character will not appear. y is typically -0.3, rx/ry typically 0. Example: show(bind_name, pose_alias, [-2, -0.3, 0.53, 0, 0]). Typical layouts: single center [0,-0.3,0.53,0,0]; two at [-2,-0.3,0.53,0,0] and [2,-0.3,0.53,0,0]; three at ~-2.5/0/2.5; four at ~-3/-1/1/3 scale~0.4. Enter from off-screen with x=4 or x=-4 then move(). x=0.6 is deliberate overlap territory - avoid |x|<1 for multi-character layouts. Keep scale changes within 30-40% of baseline.\n        13. Never use \"cam\" as the obj for tint/env_tint: \"cam\" is Camera3D with no modulate property - tint(\"cam\",...) throws an exception and crashes the tween. tint/env_tint only work on bg/fg/character objects. For whole-screen color overlay use vfx(\"cam\", [\"color\", layer_id], t, duration, {\"_ColorMul\": ...}).\n        14. You do not need to worry about cleaning up persistent effects (tint/env_tint/vfx/play) across scene boundaries - that is handled deterministically by post-generation code that auto-patches or reports issues separately. Focus on the staging each individual beat needs; do not add unnecessary cleanup calls at scene ends.".to_string(),
         format!("## NovaScript 参考文档\n\n{reference_text}"),
     ];
 
@@ -1586,10 +1556,10 @@ pub fn format_asset_path_issues(issues: &[AssetPathIssue]) -> String {
         .iter()
         .map(|issue| match &issue.suggested_path {
             Some(suggested) => format!("写了 \"{}\"，但项目里没有这个资源，应该是 \"{suggested}\"", issue.written_path),
-            None => format!("写了 \"{}\"，但项目里没有这个资源，请改用“已知背景/立绘资源路径”列表中的真实路径", issue.written_path),
+            None => format!("写了 \"{}\", 但项目里没有这个资源，请改用已知背景资源路径列表中的真实路径", issue.written_path),
         })
         .collect();
-    format!("脚本引用了不存在的资源路径：{}", details.join("；"))
+    format!("Script references non-existent asset paths: {}", details.join("；"))
 }
 
 pub fn format_audio_track_issues(issues: &[AssetPathIssue]) -> String {
@@ -1714,9 +1684,9 @@ mod tests {
         let prompt = build_generation_prompt(&dir, "", "ch1.txt", "ergong::你好\n", "加一句台词", None).unwrap();
 
         assert!(prompt.contains("ergong::你好"));
-        assert!(prompt.contains("已知角色绑定名"));
+        assert!(prompt.contains("Known Character Bind Names"));
         assert!(prompt.contains("ergong"));
-        assert!(prompt.contains("逐字保留"));
+        assert!(prompt.contains("verbatim"));
 
         fs::remove_dir_all(&dir).ok();
     }
@@ -1726,7 +1696,7 @@ mod tests {
         let dir = make_fixture_project(None);
         let prompt = build_generation_prompt(&dir, "", "new_chapter.txt", "", "写一个新故事", None).unwrap();
 
-        assert!(prompt.contains("这是一个不存在的新文件"));
+        assert!(prompt.contains("does not exist yet"));
 
         fs::remove_dir_all(&dir).ok();
     }
@@ -1744,8 +1714,8 @@ mod tests {
         )
         .unwrap();
 
-        assert!(prompt.contains("默认禁止修改对话台词文本本身"));
-        assert!(prompt.contains("绝对不能借此改写台词文字"));
+        assert!(prompt.contains("do not modify dialogue text"));
+        assert!(prompt.contains("never by rewriting dialogue"));
 
         fs::remove_dir_all(&dir).ok();
     }
@@ -1789,9 +1759,9 @@ mod tests {
         let skeleton = world_state::build_node_skeleton(&timeline, "ch1_autostage");
         let prompt = build_autostage_prompt(&dir, "", "ch1.txt", &timeline, &skeleton).unwrap();
 
-        assert!(prompt.contains("演出要求"));
+        assert!(prompt.contains("Staging Requirement"));
         assert!(prompt.contains("配雨声环境音"));
-        assert!(prompt.contains("必须把它落实成对应的函数调用"));
+        assert!(prompt.contains("fulfill it with the corresponding function call"));
 
         fs::remove_dir_all(&dir).ok();
     }
@@ -1824,9 +1794,9 @@ mod tests {
 
         // Rule 6 in build_generation_prompt is specific to editing existing content; AUTOSTAGE
         // generates fresh staging around given dialogue, so that wording must not leak in here.
-        assert!(!prompt.contains("只修改用户需求里明确要求的那部分"));
+        assert!(!prompt.contains("only modify what the user request explicitly asks for"));
         // The dialogue-preservation rule still applies, just phrased for AUTOSTAGE's own task.
-        assert!(prompt.contains("台词文本必须逐字保留"));
+        assert!(prompt.contains("preserved verbatim"));
 
         fs::remove_dir_all(&dir).ok();
     }
@@ -1854,8 +1824,8 @@ mod tests {
         let skeleton = world_state::build_node_skeleton(&timeline, "ch1_autostage");
         let prompt = build_autostage_prompt(&dir, "", "ch1.txt", &timeline, &skeleton).unwrap();
 
-        assert!(prompt.contains("已知角色绑定名"));
-        assert!(prompt.contains("已知背景资源路径"));
+        assert!(prompt.contains("Known Character Bind Names"));
+        assert!(prompt.contains("Known Background Asset Paths"));
         assert!(prompt.contains("backgrounds/room"));
 
         fs::remove_dir_all(&dir).ok();
@@ -1870,7 +1840,7 @@ mod tests {
         let prompt = build_autostage_prompt(&dir, "", "ch1.txt", &timeline, &skeleton).unwrap();
 
         assert!(prompt.contains("vvn:seq begin"));
-        assert!(prompt.contains("作者自己手写好的完整演出代码"));
+        assert!(prompt.contains("complete author-written staging code"));
 
         fs::remove_dir_all(&dir).ok();
     }
@@ -2090,9 +2060,8 @@ mod tests {
         let prompt = build_generation_prompt(&dir, "", "ch1.txt", "ergong::你好\n", "加一个画面故障效果", None).unwrap();
 
         assert!(prompt.contains("entry"));
-        assert!(prompt.contains("hold_entry"));
         assert!(prompt.contains("layer_id"));
-        assert!(prompt.contains("头部"));
+        assert!(prompt.contains("baseline"));
 
         fs::remove_dir_all(&dir).ok();
     }
@@ -2102,8 +2071,8 @@ mod tests {
         let dir = make_fixture_project(Some("ergong::你好\n"));
         let prompt = build_generation_prompt(&dir, "", "ch1.txt", "ergong::你好\n", "对峙更紧张", None).unwrap();
 
-        assert!(prompt.contains("缓和/转折点"));
-        assert!(prompt.contains("只升不降"));
+        assert!(prompt.contains("turning point"));
+        assert!(prompt.contains("track narrative tension"));
 
         fs::remove_dir_all(&dir).ok();
     }

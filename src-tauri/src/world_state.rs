@@ -489,7 +489,7 @@ pub fn build_node_skeleton(timeline: &WorldStateTimeline, base_label: &str) -> S
                         first_moment_emitted = true;
                     }
                     if let Some(hint) = &moment.active_hint {
-                        output.push_str(&format!("# 演出要求（必须落实成具体函数调用，不能忽略）：{hint}\n"));
+                        output.push_str(&format!("# Staging Requirement (must be implemented as a function call, cannot be ignored): {hint}\n"));
                     }
                     output.push_str(SKELETON_STAGING_TODO);
                     output.push_str("\n|>\n");
