@@ -983,11 +983,18 @@ impl AppRuntime {
             // sentinel markers (or a human who hand-typed them into an EDIT-mode script, which
             // deserves the same flag) - a harmless no-op for every other script.
             let unclosed_sequence_issues = check_unclosed_sequences(&script);
+            // Show-class lifecycle issues (a character shown but not hidden) are deliberately NOT
+            // in this gate. They're valid NovaScript that reload accepts, and whether the object
+            // *should* still be on screen - including at an ending - is a content judgment, not a
+            // determinate error. Gating on them made the retry loop burn all attempts re-asking the
+            // model to reconsider a call it had every right to make, ending in `applied: false` on
+            // a script that would have loaded fine. They ride along as advisory feedback on retries
+            // triggered by the real (determinate) failures below, and surface to the author in
+            // preview otherwise.
             if !asset_issues.is_empty()
                 || !audio_issues.is_empty()
                 || !sound_issues.is_empty()
                 || !shader_issues.is_empty()
-                || !lifecycle_issues.is_empty()
                 || !closure_issues.is_empty()
                 || !unclosed_sequence_issues.is_empty()
             {
@@ -1081,7 +1088,14 @@ impl AppRuntime {
                         "Godot reload rejected the draft; asking the model for a corrected version",
                         Some(attempts),
                     );
-                    prompt = build_retry_prompt(&base_prompt, &script, &error.error);
+                    let mut retry = build_retry_prompt(&base_prompt, &script, &error.error);
+                    // Fold the advisory Show-class feedback in too, so if we're already retrying
+                    // for a real reload failure the model also hears about anything left on screen.
+                    if !lifecycle_issues.is_empty() {
+                        retry.push_str("\n\n");
+                        retry.push_str(&format_lifecycle_issues(&lifecycle_issues));
+                    }
+                    prompt = retry;
                     last_error = Some(error.error);
                 }
             }

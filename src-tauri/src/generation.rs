@@ -724,8 +724,12 @@ pub(crate) fn check_lifecycle_issues(script: &str) -> Vec<LifecycleIssue> {
         }
     }
 
-    // One past the last line, so an EOF auto-fix appends after the final line rather than
-    // displacing it (see apply_lifecycle_autofixes's insert-before-boundary-line convention).
+    // One past the last line: sorts after every real boundary and reads as "past the end". It is
+    // NOT used as an insertion index - EOF fixes can't follow the mid-script "bare line before the
+    // boundary line" convention (there's no boundary call to land inside, and this index points
+    // past the terminal `@<| is_end()/jump_to()/branch() |>`). apply_lifecycle_autofixes splices
+    // EOF fixes into a fresh lazy block placed *before* that terminator instead. This value is
+    // still the boundary_line stamped on EOF issues for reporting.
     let final_line = script.lines().count() as u32 + 1;
     flush_lifecycle_boundary(final_line, "eof", &mut tint_open, &mut env_tint_open, &mut vfx_open, &mut audio_open, &show_open, &mut issues);
 
@@ -734,19 +738,56 @@ pub(crate) fn check_lifecycle_issues(script: &str) -> Vec<LifecycleIssue> {
 
 /// Splits `check_lifecycle_issues` findings into mechanical fixes (tint/env_tint/vfx/audio - one
 /// unambiguous closed value, applied directly with no model round trip) and judgment calls (show -
-/// returned for the caller to feed back to the model). Auto-fixes are inserted as new lines
-/// immediately before their boundary line, processed bottom-to-top so earlier insertions don't
-/// shift the line numbers later ones still need.
+/// returned for the caller to feed back to the model). Mid-script fixes are inserted as bare lines
+/// immediately before their boundary call, bottom-to-top so earlier insertions don't shift the
+/// line numbers later ones still need. EOF fixes can't follow that convention (there's no boundary
+/// call to land inside, and a bare top-level GDScript call outside any `<| |>` block would parse
+/// as dialogue text) - they're wrapped in a fresh lazy block placed before the final node's
+/// terminator (`@<| is_end()/jump_to()/branch() |>`), which stays the last eager block.
 pub fn apply_lifecycle_autofixes(script: &str) -> (String, Vec<LifecycleIssue>) {
     let issues = check_lifecycle_issues(script);
-    let mut auto_fixable: Vec<&LifecycleIssue> = issues.iter().filter(|issue| issue.auto_fix.is_some()).collect();
-    auto_fixable.sort_by_key(|issue| std::cmp::Reverse(issue.boundary_line));
 
     let mut lines: Vec<String> = script.lines().map(str::to_string).collect();
-    for issue in auto_fixable {
+
+    // Mid-script fixes first, bottom-to-top so earlier insertions don't shift the lines later ones
+    // still target. The boundary here is a real `trans*` / `show`-switch / `# vvn:seq end` line
+    // that itself lives inside a lazy block, so inserting the bare fix line immediately before it
+    // lands the call inside that block - valid NovaScript.
+    let mut mid_fixes: Vec<&LifecycleIssue> = issues
+        .iter()
+        .filter(|issue| issue.auto_fix.is_some() && issue.boundary_kind != "eof")
+        .collect();
+    mid_fixes.sort_by_key(|issue| std::cmp::Reverse(issue.boundary_line));
+    for issue in mid_fixes {
         let Some(fix_line) = &issue.auto_fix else { continue };
         let insert_at = (issue.boundary_line.saturating_sub(1) as usize).min(lines.len());
         lines.insert(insert_at, fix_line.clone());
+    }
+
+    // EOF fixes need different handling: at end-of-script there's no boundary call to fall inside,
+    // and the fixes are raw calls (`vfx(...)`, `stop(...)`, ...) that would be a parse error at top
+    // level, so they get wrapped in one fresh lazy block. That block must go *before* the final
+    // node's terminator - `@<| is_end() |>` (or jump_to/branch) is a terminal statement, nothing
+    // valid follows it. The terminator is the last eager `@<|` block in the file (node labels are
+    // the only other `@<|` lines, and every terminator sits after its node's label). Computed after
+    // the mid-script pass so the position accounts for those insertions. Absent a terminator (an
+    // EDIT-mode fragment), a trailing lazy block is valid on its own.
+    let eof_fixes: Vec<String> = issues
+        .iter()
+        .filter(|issue| issue.boundary_kind == "eof")
+        .filter_map(|issue| issue.auto_fix.clone())
+        .collect();
+    if !eof_fixes.is_empty() {
+        let terminator_at = lines
+            .iter()
+            .rposition(|line| line.trim_start().starts_with("@<|"))
+            .unwrap_or(lines.len());
+        let mut block = vec!["<|".to_string()];
+        block.extend(eof_fixes);
+        block.push("|>".to_string());
+        for (offset, fix_line) in block.into_iter().enumerate() {
+            lines.insert(terminator_at + offset, fix_line);
+        }
     }
 
     let remaining: Vec<LifecycleIssue> = issues.into_iter().filter(|issue| issue.auto_fix.is_none()).collect();
@@ -754,17 +795,26 @@ pub fn apply_lifecycle_autofixes(script: &str) -> (String, Vec<LifecycleIssue>) 
 }
 
 /// Formats the judgment-only (non-auto-fixable, i.e. `Show`) issues `apply_lifecycle_autofixes`
-/// returns into a single message for `build_retry_prompt`, matching the other `format_*_issues`
-/// functions' tone: explain what was found, point at the exact lines, suggest the fix without
-/// applying it - "should this object still be on screen" is a content call, not code's to make.
+/// returns into a single message. These are advisory only - they never gate the retry loop (a
+/// character still on screen is valid NovaScript that reload accepts; whether it *should* be is a
+/// content call, left to the author in preview), so this message rides along on a retry triggered
+/// by a real failure rather than causing one. EOF ("still on screen when the script ends") is
+/// phrased separately from a mid-script scene switch: an ending tableau is usually intentional.
 pub fn format_lifecycle_issues(issues: &[LifecycleIssue]) -> String {
     let details: Vec<String> = issues
         .iter()
         .map(|issue| {
-            format!(
-                "第{}行对 \"{}\" 调用了 show，但第{}行的场景切换（{}）之前没有 hide，请确认该对象是否应该在新场景里继续显示——需要的话补一条 hide(\"{}\")，如果确实要保留，也请在脚本里体现出这是有意保留的",
-                issue.opened_at_line, issue.object, issue.boundary_line, issue.boundary_kind, issue.object
-            )
+            if issue.boundary_kind == "eof" {
+                format!(
+                    "第{}行对 \"{}\" 调用了 show，脚本结束时它仍在场且没有 hide。如果这是有意的结局留白（角色停在最后一幕）就无需处理；只有当你希望它在结尾前消失时，才补一条 hide(\"{}\")",
+                    issue.opened_at_line, issue.object, issue.object
+                )
+            } else {
+                format!(
+                    "第{}行对 \"{}\" 调用了 show，但第{}行的场景切换（{}）之前没有 hide，请确认该对象是否应该在新场景里继续显示——需要的话补一条 hide(\"{}\")，如果确实要保留，也请在脚本里体现出这是有意保留的",
+                    issue.opened_at_line, issue.object, issue.boundary_line, issue.boundary_kind, issue.object
+                )
+            }
         })
         .collect();
     format!("脚本中存在跨场景未关闭的显示状态：{}", details.join("；"))
@@ -1842,13 +1892,34 @@ mod tests {
     }
 
     #[test]
-    fn auto_fix_at_eof_appends_after_last_line_instead_of_replacing_it() {
+    fn eof_autofix_without_terminator_appends_a_wrapped_lazy_block() {
+        // No `@<| |>` terminator (an EDIT-mode fragment): the audio cleanup must still be wrapped
+        // in a lazy block rather than left as a bare top-level call (which would be a parse error).
         let script = "show(\"yuki\", \"normal\")\nplay(\"bgm\", \"prelude\", 0.5)\n";
         let (patched, _remaining) = apply_lifecycle_autofixes(script);
         let lines: Vec<&str> = patched.lines().collect();
         assert_eq!(lines[0], "show(\"yuki\", \"normal\")");
         assert_eq!(lines[1], "play(\"bgm\", \"prelude\", 0.5)");
-        assert_eq!(lines.last().copied(), Some("stop(\"bgm\", 0)"));
+        assert_eq!(lines[2], "<|");
+        assert_eq!(lines[3], "stop(\"bgm\", 0)");
+        assert_eq!(lines[4], "|>");
+    }
+
+    #[test]
+    fn eof_autofix_wraps_in_lazy_block_before_terminal_is_end() {
+        // The original bug: a cam-vfx cleanup was appended *after* `@<| is_end() |>` as a bare
+        // top-level line, which the engine parsed as dialogue -> reload parse error. The fix must
+        // land inside a fresh lazy block, immediately before the terminator, which stays last.
+        let script = "<|\nvfx(\"cam\", \"shake\", 0.5, 0.1)\n|>\n旁白：雨还在下。\n@<| is_end() |>\n";
+        let (patched, _remaining) = apply_lifecycle_autofixes(script);
+        let lines: Vec<&str> = patched.lines().collect();
+        assert_eq!(lines.last().copied(), Some("@<| is_end() |>"));
+        let end_idx = lines.iter().position(|line| line.trim() == "@<| is_end() |>").unwrap();
+        assert_eq!(lines[end_idx - 3], "<|");
+        assert_eq!(lines[end_idx - 2], "vfx(\"cam\", [null, 0])");
+        assert_eq!(lines[end_idx - 1], "|>");
+        // The fix actually closed the layer: re-checking finds no vfx left open.
+        assert!(check_lifecycle_issues(&patched).iter().all(|issue| issue.call_kind != LifecycleCallKind::Vfx));
     }
 
     #[test]
