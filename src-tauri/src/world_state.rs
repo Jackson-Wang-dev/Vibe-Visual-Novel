@@ -496,7 +496,22 @@ pub fn build_node_skeleton(timeline: &WorldStateTimeline, base_label: &str) -> S
         }
 
         match &node.terminator {
-            NodeTerminator::End => output.push_str("@<| is_end() |>\n"),
+            NodeTerminator::End => {
+                // An empty main node whose only declared terminator is End, but there are
+                // named nodes after it, means the user started with #branch:/#node: right away
+                // with no leading dialogue - the main node should flow into the first named node
+                // rather than ending immediately (which would produce a gray screen at launch).
+                let auto_jump = node_index == 0
+                    && node.items.is_empty()
+                    && node_count > 1
+                    && timeline.nodes[1].name.is_some();
+                if auto_jump {
+                    let first_named = timeline.nodes[1].name.as_deref().unwrap();
+                    output.push_str(&format!("@<| jump_to(\"{first_named}\") |>\n"));
+                } else {
+                    output.push_str("@<| is_end() |>\n");
+                }
+            }
             NodeTerminator::Jump(dest) => output.push_str(&format!("@<| jump_to(\"{dest}\") |>\n")),
             NodeTerminator::Branch(options) => {
                 output.push_str("@<| branch([\n");
