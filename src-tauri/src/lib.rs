@@ -978,12 +978,22 @@ impl AppRuntime {
                 Some(attempts),
             );
 
+            // Re-read known characters after registration so validators don't misidentify
+            // #NEWCHARS show(bind, pose) calls as unknown asset-path references.
+            // known_characters was loaded before the LLM call; register_new_characters()
+            // just wrote new entries to game.tscn, so a fresh read picks them up.
+            let effective_known_characters = if new_chars.is_empty() {
+                known_characters.clone()
+            } else {
+                list_known_character_bind_names(nova2_project_dir)
+            };
+
             // Static checks first: Godot's load() on a missing texture/shader/track path silently
             // returns null instead of throwing, so any of these hallucinations would otherwise
             // sail through reload looking "successful". Catching them here also skips a Godot
             // reload round trip when one fires, and folds every category found into a single
             // retry instead of needing one retry per category.
-            let asset_issues = find_unknown_asset_paths(&script, &known_asset_paths, &known_characters);
+            let asset_issues = find_unknown_asset_paths(&script, &known_asset_paths, &effective_known_characters);
             let pose_issues = find_unknown_character_poses(&script, &character_poses);
             let audio_issues = find_unknown_audio_tracks(&script, &known_audio_layout);
             let sound_issues = find_unknown_sound_tracks(&script, &known_audio_layout.one_shot_tracks);
