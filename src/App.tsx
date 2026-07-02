@@ -43,7 +43,6 @@ const agentStepIndexById = new Map(agentSteps.map((step, index) => [step.id, ind
 type GeneratePanelState = {
   userPrompt: string;
   targetFile: string;
-  autostageLabel: string;
   result: GenerateResult | null;
 };
 
@@ -54,6 +53,7 @@ type RegularizeState = {
   markerText: string;
   view: ConfirmationView | null;
   correctionNote: string;
+  labelName: string;
 };
 
 const emptyRegularizeState: RegularizeState = {
@@ -63,6 +63,7 @@ const emptyRegularizeState: RegularizeState = {
   markerText: "",
   view: null,
   correctionNote: "",
+  labelName: "",
 };
 
 const emptyState: PreviewBridgeState = {
@@ -113,7 +114,6 @@ function App() {
   const [generatePanel, setGeneratePanel] = useState<GeneratePanelState>({
     userPrompt: "",
     targetFile: "",
-    autostageLabel: "",
     result: null,
   });
   const [statusTone, setStatusTone] = useState<StatusTone>("idle");
@@ -549,40 +549,6 @@ function App() {
     }
   };
 
-  const handleGenerateScript = async () => {
-    if (!generatePanel.targetFile.trim()) {
-      applyError({ message: "请先选择 target_file" }, "AI 生成失败");
-      return;
-    }
-    setIsGeneratingScript(true);
-    setAgentStepIndex(0);
-    setGeneratePanel((current) => ({ ...current, result: null }));
-    setStatusTone("busy");
-    setStatusTitle("正在调用 AI 生成剧本");
-    setStatusMessage(`当前预览定位将作为后续“上下文优先修改”的基准。本轮 UI 先把 AI 工作台提升到最前面，生成结果仍会自动写回 ${generatePanel.targetFile}。`);
-    setLastError(null);
-    try {
-      const result = await previewBridgeClient.generateScriptWithRetry(generatePanel.userPrompt, generatePanel.targetFile);
-      setGeneratePanel((current) => ({ ...current, result }));
-      if (result.applied) {
-        await loadScriptContent(generatePanel.targetFile);
-        await refreshRuntimeStatus();
-        setStatusTone("success");
-        setStatusTitle("AI 生成完成并已应用");
-        setStatusMessage(`已在第 ${result.attempts} 次尝试后成功 reload。请先看游戏窗口验证效果；如果要做更底层修改，再展开开发者模块。`);
-      } else {
-        setStatusTone("error");
-        setStatusTitle("AI 生成未通过引擎校验");
-        setStatusMessage(`已尝试 ${result.attempts} 次，但最终 reload 仍失败。你可以在开发者模块里查看脚本，并继续手工修正。`);
-        setLastError(result.lastError ?? null);
-      }
-    } catch (error) {
-      applyUnknownError(error, "AI 生成失败");
-    } finally {
-      setIsGeneratingScript(false);
-    }
-  };
-
   const handleIncrementalTweak = async () => {
     if (!generatePanel.targetFile.trim()) {
       applyError({ message: "请先选择 target_file" }, "AI 微调失败");
@@ -655,8 +621,6 @@ function App() {
     }
   };
 
-  const handleAutostage = () => runAutostage(generatePanel.userPrompt, generatePanel.autostageLabel.trim() || undefined);
-
   const handleOpenRegularize = () => {
     setRegularizeState({ ...emptyRegularizeState, isOpen: true, freeScript: generatePanel.userPrompt });
   };
@@ -690,8 +654,9 @@ function App() {
 
   const handleConfirmRegularize = async () => {
     const markerText = regularizeState.markerText;
+    const labelName = regularizeState.labelName.trim() || undefined;
     handleCloseRegularize();
-    await runAutostage(markerText);
+    await runAutostage(markerText, labelName);
   };
 
   return (
@@ -874,8 +839,7 @@ function App() {
                     placeholder="例如：把当前预览附近的对话改得更克制，增加停顿感，并把背景切到夜晚教室。"
                   />
                   <span className="field-hint">
-                    用“AUTOSTAGE 补全演出”时，这里改填纯对话台词（每行 `显示名::台词`）。场景切换用 `#loc: 背景路径` 单独一行标注；想给某一拍指定具体要求（用什么音乐/动画等），用
-                    `#hnt: 要求内容` 单独一行标注，这条要求会一直生效到下一个 `#loc:` 或下一个 `#hnt:`（写 `#hnt:` 不带内容可以提前清除）；其余以 `#` 开头但不是这两种的行会被当成注释直接忽略。AI 只负责在搭好的节点骨架里补演出，不会改动台词本身。
+                    “AUTOSTAGE”：怎么写都行，随便贴剧情/大纲/对话，AI 先理解成结构给你确认，再补演出。”微调当前章节”：这里填自然语言修改需求，针对当前预览位置定向改写。
                   </span>
                 </label>
                 <div className="ai-inline-grid">
@@ -898,8 +862,13 @@ function App() {
                     </select>
                   </label>
                   <div className="ai-action-stack">
-                    <button type="button" onClick={handleGenerateScript} disabled={isGeneratingScript || isLoadingProject || isHydrating || !generatePanel.userPrompt.trim()}>
-                      {isGeneratingScript ? "生成中..." : "开始生成"}
+                    <button
+                      type="button"
+                      onClick={handleOpenRegularize}
+                      disabled={isGeneratingScript || isLoadingProject || isHydrating}
+                      title="怎么写都行——剧本/大纲/对话随便贴，AI 先理解成结构，给你看一遍确认稿，你确认后再进入生成"
+                    >
+                      AUTOSTAGE
                     </button>
                     <button
                       type="button"
@@ -913,34 +882,9 @@ function App() {
                         bridgeState.currentNodeRecordId === null ||
                         bridgeState.currentDialogueIndex === null
                       }
+                      title="根据下方文字需求，针对当前预览位置的前后内容进行定向修改"
                     >
-                      微调当前预览
-                    </button>
-                    <input
-                      type="text"
-                      className="label-name-input"
-                      value={generatePanel.autostageLabel}
-                      onChange={(e) => setGeneratePanel((c) => ({ ...c, autostageLabel: e.target.value }))}
-                      placeholder={`章节标签名（留空 = ${generatePanel.targetFile ? generatePanel.targetFile.replace(/\.txt$/, "") + "_autostage" : "autostage"}）`}
-                      title="AUTOSTAGE 生成的节点入口标签名。留空时自动取文件名加 _autostage 后缀。"
-                    />
-                    <button
-                      type="button"
-                      className="secondary-button"
-                      onClick={handleAutostage}
-                      disabled={isGeneratingScript || isLoadingProject || isHydrating || !generatePanel.userPrompt.trim()}
-                      title="文本框需要是纯对话台词（显示名::台词），场景切换用 #loc: 背景路径 标注，具体要求用 #hnt: 要求内容 标注（持续生效到下一个 #loc/#hnt）；AI 只填演出，不改台词"
-                    >
-                      AUTOSTAGE 补全演出
-                    </button>
-                    <button
-                      type="button"
-                      className="secondary-button"
-                      onClick={handleOpenRegularize}
-                      disabled={isGeneratingScript || isLoadingProject || isHydrating}
-                      title="怎么写都行——剧本/大纲/对话随便贴，AI 先理解成结构，给你看一遍确认稿，你确认后再进入 AUTOSTAGE"
-                    >
-                      AUTOSTAGE（自由剧本）
+                      微调当前章节
                     </button>
                   </div>
                 </div>
@@ -1250,14 +1194,13 @@ function App() {
         <div className="regularize-overlay">
           <div className="card regularize-panel">
             <div className="panel-header">
-              <h2>AUTOSTAGE（自由剧本）</h2>
+              <h2>AUTOSTAGE</h2>
               <button type="button" className="secondary-button compact-button" onClick={handleCloseRegularize}>
                 关闭
               </button>
             </div>
             <p className="editor-hint">
-              怎么写都行——大纲、对话、舞台指示混在一起也没关系。AI 只做“理解 + 规整”这一次调用，下面会给你看一份它理解出来的人话确认稿；确认无误（或改完确认说明重新理解）之后才会真正进入
-              AUTOSTAGE 补全演出。
+              怎么写都行——大纲、对话、舞台指示混在一起也没关系。AI 先做一次”理解 + 规整”，把你写的东西转成结构化确认稿给你看；确认无误后才进入演出填充阶段。
             </p>
             <label>
               <span className="field-label">自由格式剧本原文</span>
@@ -1315,9 +1258,20 @@ function App() {
                     placeholder="例如：小王这个角色其实就是已知角色里的“王浩然”，请重新理解"
                   />
                 </label>
+                <label>
+                  <span className="field-label">入口章节标签名（留空 = 文件名_autostage）</span>
+                  <input
+                    type="text"
+                    className="label-name-input"
+                    value={regularizeState.labelName}
+                    onChange={(e) => setRegularizeState((c) => ({ ...c, labelName: e.target.value }))}
+                    placeholder={generatePanel.targetFile ? generatePanel.targetFile.replace(/\.txt$/, "") + "_autostage" : "autostage"}
+                    title="这次 AUTOSTAGE 生成的主入口节点名。内部分支节点会自动加 l_ 前缀变成文件局部节点，无需手动设置。一个文件可以包含多个章节，每次 AUTOSTAGE 生成一个入口节点段落。"
+                  />
+                </label>
                 <div className="ai-action-stack">
                   <button type="button" onClick={handleConfirmRegularize} disabled={isGeneratingScript}>
-                    确认并继续 AUTOSTAGE
+                    确认并生成演出
                   </button>
                   <button
                     type="button"
