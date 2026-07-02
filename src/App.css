@@ -812,6 +812,17 @@ label {
   box-shadow: none;
 }
 
+.label-name-input {
+  flex: 1 1 180px;
+  min-width: 0;
+  padding: 0.45rem 0.7rem;
+  border-radius: 8px;
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  background: rgba(255, 255, 255, 0.04);
+  color: #dde8fb;
+  font-size: 0.82rem;
+}
+
 .seek-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));

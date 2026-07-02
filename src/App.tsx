@@ -43,6 +43,7 @@ const agentStepIndexById = new Map(agentSteps.map((step, index) => [step.id, ind
 type GeneratePanelState = {
   userPrompt: string;
   targetFile: string;
+  autostageLabel: string;
   result: GenerateResult | null;
 };
 
@@ -112,6 +113,7 @@ function App() {
   const [generatePanel, setGeneratePanel] = useState<GeneratePanelState>({
     userPrompt: "",
     targetFile: "",
+    autostageLabel: "",
     result: null,
   });
   const [statusTone, setStatusTone] = useState<StatusTone>("idle");
@@ -619,7 +621,7 @@ function App() {
     }
   };
 
-  const runAutostage = async (dialogueOnlyText: string) => {
+  const runAutostage = async (dialogueOnlyText: string, labelName?: string) => {
     if (!generatePanel.targetFile.trim()) {
       applyError({ message: "请先选择 target_file" }, "AUTOSTAGE 失败");
       return;
@@ -632,7 +634,7 @@ function App() {
     setStatusMessage(`会把纯对话台词搭好节点骨架，再让 AI 在骨架内填充演出，结果写回 ${generatePanel.targetFile}。`);
     setLastError(null);
     try {
-      const result = await previewBridgeClient.autostage(dialogueOnlyText, generatePanel.targetFile);
+      const result = await previewBridgeClient.autostage(dialogueOnlyText, generatePanel.targetFile, labelName);
       setGeneratePanel((current) => ({ ...current, result }));
       if (result.applied) {
         await loadScriptContent(generatePanel.targetFile);
@@ -653,7 +655,7 @@ function App() {
     }
   };
 
-  const handleAutostage = () => runAutostage(generatePanel.userPrompt);
+  const handleAutostage = () => runAutostage(generatePanel.userPrompt, generatePanel.autostageLabel.trim() || undefined);
 
   const handleOpenRegularize = () => {
     setRegularizeState({ ...emptyRegularizeState, isOpen: true, freeScript: generatePanel.userPrompt });
@@ -914,6 +916,14 @@ function App() {
                     >
                       微调当前预览
                     </button>
+                    <input
+                      type="text"
+                      className="label-name-input"
+                      value={generatePanel.autostageLabel}
+                      onChange={(e) => setGeneratePanel((c) => ({ ...c, autostageLabel: e.target.value }))}
+                      placeholder={`章节标签名（留空 = ${generatePanel.targetFile ? generatePanel.targetFile.replace(/\.txt$/, "") + "_autostage" : "autostage"}）`}
+                      title="AUTOSTAGE 生成的节点入口标签名。留空时自动取文件名加 _autostage 后缀。"
+                    />
                     <button
                       type="button"
                       className="secondary-button"

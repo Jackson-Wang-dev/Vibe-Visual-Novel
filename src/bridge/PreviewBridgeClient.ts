@@ -129,9 +129,9 @@ export class PreviewBridgeClient {
   // travels in the userPrompt field (see autostage_inner in lib.rs), since the backend's
   // GenerateRequest has no dedicated field for it and adding one would mean a second request type
   // for what's otherwise an identical { userPrompt, targetFile } shape.
-  async autostage(dialogueOnlyText: string, targetFile: string): Promise<GenerateResult> {
+  async autostage(dialogueOnlyText: string, targetFile: string, labelName?: string): Promise<GenerateResult> {
     return invoke<GenerateResult>("autostage", {
-      request: { userPrompt: dialogueOnlyText, targetFile },
+      request: { userPrompt: dialogueOnlyText, targetFile, labelName: labelName || null },
     });
   }
 

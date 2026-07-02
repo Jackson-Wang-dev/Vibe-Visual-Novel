@@ -225,6 +225,8 @@ struct LoadProjectResult {
 struct GenerateRequest {
     user_prompt: String,
     target_file: String,
+    #[serde(default)]
+    label_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -901,7 +903,10 @@ impl AppRuntime {
                 prompt
             }
             GenerationMode::Autostage { dialogue_only_text } => {
-                let base_label = autostage_label_base(&request.target_file);
+                let base_label = request.label_name.as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| autostage_label_base(&request.target_file));
                 // Malformed marker structure (a dangling #opt:/#jump: dest, a #branch: with no
                 // options, etc) is caught here, deterministically, before any LLM call is made -
                 // fail fast rather than spending a generation attempt on input that can't possibly
