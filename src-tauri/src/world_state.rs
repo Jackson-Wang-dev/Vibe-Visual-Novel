@@ -469,7 +469,13 @@ pub fn build_node_skeleton(timeline: &WorldStateTimeline, base_label: &str) -> S
     let mut first_moment_emitted = false;
 
     for (node_index, node) in timeline.nodes.iter().enumerate() {
-        let label_name = node.name.clone().unwrap_or_else(|| base_label.to_string());
+        // Named nodes (declared via #node:) get the l_ prefix to make them file-local,
+        // preventing "Overwrite node" conflicts when multiple scripts share the same node name.
+        // The main entry node (node.name is None) keeps base_label as a global label since it is
+        // the chapter entry point referenced from the game's scene tree.
+        let label_name = node.name.as_deref()
+            .map(|n| format!("l_{n}"))
+            .unwrap_or_else(|| base_label.to_string());
         output.push_str("@<|\n");
         output.push_str(&format!("label(\"{label_name}\", \"AUTOSTAGE\")\n"));
         if node_index == 0 {
@@ -520,16 +526,16 @@ pub fn build_node_skeleton(timeline: &WorldStateTimeline, base_label: &str) -> S
                     && timeline.nodes[1].name.is_some();
                 if auto_jump {
                     let first_named = timeline.nodes[1].name.as_deref().unwrap();
-                    output.push_str(&format!("@<| jump_to(\"{first_named}\") |>\n"));
+                    output.push_str(&format!("@<| jump_to(\"l_{first_named}\") |>\n"));
                 } else {
                     output.push_str("@<| is_end() |>\n");
                 }
             }
-            NodeTerminator::Jump(dest) => output.push_str(&format!("@<| jump_to(\"{dest}\") |>\n")),
+            NodeTerminator::Jump(dest) => output.push_str(&format!("@<| jump_to(\"l_{dest}\") |>\n")),
             NodeTerminator::Branch(options) => {
                 output.push_str("@<| branch([\n");
                 for option in options {
-                    let mut fields = vec![format!("dest=\"{}\"", option.dest)];
+                    let mut fields = vec![format!("dest=\"l_{}\"", option.dest)];
                     if let Some(text) = &option.text {
                         fields.push(format!("text=\"{text}\""));
                     }
@@ -969,7 +975,7 @@ mod tests {
     fn skeleton_named_node_uses_its_declared_name_as_label() {
         let text = "二宫::开场\n#node: my_node\n旁白::内容\n";
         let skeleton = build_node_skeleton(&timeline(text), "ch1_autostage");
-        assert!(skeleton.contains("label(\"my_node\""));
+        assert!(skeleton.contains("label(\"l_my_node\""));
     }
 
     #[test]
@@ -994,7 +1000,8 @@ mod tests {
         let text = "#branch:\n#opt: a | 选A | show | v_flag > 0\n#node: a\n旁白::A\n";
         let skeleton = build_node_skeleton(&timeline(text), "ch1_autostage");
         assert!(skeleton.contains("branch(["));
-        assert!(skeleton.contains("dest=\"a\""));
+        assert!(skeleton.contains("dest=\"l_a\""));
+        assert!(skeleton.contains("label(\"l_a\""));
         assert!(skeleton.contains("text=\"选A\""));
         assert!(skeleton.contains("mode=\"show\""));
         assert!(skeleton.contains("cond=\"v_flag > 0\""));
@@ -1004,7 +1011,7 @@ mod tests {
     fn skeleton_branch_option_omits_absent_fields_from_emitted_dict() {
         let text = "#branch:\n#opt: a\n#node: a\n旁白::A\n";
         let skeleton = build_node_skeleton(&timeline(text), "ch1_autostage");
-        let branch_line = skeleton.lines().find(|l| l.contains("dest=\"a\"")).unwrap();
+        let branch_line = skeleton.lines().find(|l| l.contains("dest=\"l_a\"")).unwrap();
         assert!(!branch_line.contains("text="));
         assert!(!branch_line.contains("mode="));
         assert!(!branch_line.contains("cond="));
@@ -1014,7 +1021,7 @@ mod tests {
     fn skeleton_jump_terminator_emits_jump_to_call_with_dest() {
         let text = "#node: a\n旁白::A\n#jump: b\n#node: b\n旁白::B\n";
         let skeleton = build_node_skeleton(&timeline(text), "ch1_autostage");
-        assert!(skeleton.contains("jump_to(\"b\")"));
+        assert!(skeleton.contains("jump_to(\"l_b\")"));
     }
 
     #[test]
